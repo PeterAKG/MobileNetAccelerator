@@ -1,13 +1,17 @@
 import pandas as pd
 import matplotlib.pyplot as plt
+import numpy as np
 
 totalTime = 31084032
 df = pd.read_excel('ThroughputCalculations.xlsx')
 
 totalTime = int(df["Time to output (CLK CYCLES)"][30])
 
+clkCycles = 0
 timeToOutput = []
 inputChannelsCompleted = []
+inputChannelCompletionTimes = []
+inputChannelStartTimes = []
 inputChannelsUsedDWCV = []
 inputChannelsUsedPWCV = [] # For pointwise each output channel needs to have a seperate input channels used array
 totalInputChannels = []
@@ -21,6 +25,8 @@ pwcvFinishedWork = []
 itemsToRemove = [] # A list of all "dead" weights which no longer need to be used. That way, when the memory needs to add an element, it knows
                    # what element to take out. Weights are stored as tuples: (layer, output channel, input channel block). Depthwise weights
                    # only use the first two arguments. Pointwise weights use the third as well.
+
+counter = 0
 
 for idx, row in df.iterrows():
     if(idx >= 1 and idx < 27):
@@ -37,93 +43,35 @@ for idx, row in df.iterrows():
         
         for channel in range(totalOutputChannels[idx - 1]):
             inputChannelsUsedPWCV[idx - 1].append(0)
+        
+        if(layerType[idx - 1] == "Depthwise"):
+            inputChannelCompletionTimes.append([])
+            inputChannelStartTimes.append([])
             
-class memory:
-    
-    # Storage is measured in bytes
-    # Throughput is measured in bytes per clock cycle
-    def __init__(self, DDRstorage, BRAMstorage, DDRthroughput, BRAMthroughput):
-        self.DDRStorage = DDRstorage #We low key may not need this, and we can just assume DDR has infinite memory
-        self.BRAMStorage = BRAMstorage
-        self.DDRthroughput = DDRthroughput
-        self.BRAMthroughput = BRAMthroughput
-        self.BRAMused = 0
-        
-        # Every index of the weight list is a layer. Every element (layer) points to another list. That list shows what weights are loaded in the weight list.
-        # For depthwise convolution it's simple, each input channel corresponds to an output channel, so you just have a list where every index is an output
-        # channel, 1 for kernel loaded, 0 for kernel not loaded.
-        # For pointwise convolution it's less simple, each output channel has one kernel, but that kernel may be more than the pointwise convolution unit has
-        # access to. So we split the kernel into groups of 32. So even though we have a kernel with [input channels] number of weights, the number of kernels
-        # is [input channels/32]. So, every index corresponds to an output channel, which points to another list, showing which groups of 32 weights have been
-        # loaded from the input channels.
-        # So, just a reminder, here is the structure of the list:
-        # weightList = [layer0, layer1, layer2, layer3, ..., layerN]
-        #                  |         |
-        #     (Depthwise) \|/        |
-        # [9, 9, 9, 5, ..., 0, 0]    |
-        # (Index signifies output    |
-        # channel, the number        |
-        # signifies how many         |
-        # out of the 9 needed        |
-        # for a kernel are present)  |
-        #                           \|/ (Pointwise)
-        #           [OutChnl0, OutChnl1, OutChnl2, ...]
-        #               |
-        #              \|/
-        #      [32, 32, 15, ..., 0, 0]
-        # (Index signifies group of 32
-        # input channels. The number present
-        # signifies the number of weights out
-        # of that group of 32 which are currently
-        # loaded.)
-        
-        self.weightList = []
-        
-        # Initialization
-        for idx in range(28):
-            self.weightList.append([])
-            if(layerType[idx] == "Depthwise"):
-                for outChannel in range(totalOutputChannels[idx]):
-                    self.weightList[idx].append(0)
-            elif(layerType[idx] == "Pointwise"):
-                for outChannel in range(totalOutputChannels[idx]):
-                    self.weightList[idx].append([])
-                    for inChannel in range(totalInputChannels[idx]//32):
-                        self.weightList[idx][outChannel].append(0)
-            else:
-                raise RuntimeError("Error: Found a layer which is neither pointwise or depthwise")
-        
-    # Input channel block only used for pointwise convolution
-    def loadWeights(self, layer, outputChannel, inputChannelBlock):
-        # We need an algorithm to determine what channel to take out and what channel to take in
-        if(self.memoryFull()):
-            raise RuntimeError("Error: Can't load weights if memory is currently full")
-        
-        
-        self.BRAMused += 1
-        
-        if(layerType[layer] == "Depthwise"):
-            self.weightList[layer][outputChannel] += 1
-        elif(layerType[layer] == "Pointwise"):
-            self.weightList[layer][outputChannel][inputChannelBlock] += 1
-        else:
-            raise RuntimeError("Error: Found a layer which is neither pointwise or depthwise")
-        
-    def contains(self, layer, outputChannel, inputChannelBlock):
-        if(layerType[layer] == "Depthwise"):
-            return self.weightList[layer][outputChannel]
-        elif(layerType[layer] == "Pointwise"):
-            return self.weightList[layer][outputChannel][inputChannelBlock]
-        else:
-            raise RuntimeError("Error: Found a layer which is neither pointwise or depthwise")
-    
-    def memoryFull(self):
-        if(self.BRAMused == self.BRAMStorage and len(itemsToRemove) == 0):
-            return True
-        else:
-            return False
+        if(layerType[idx - 1] == "Pointwise"):
+            inputChannelCompletionTimes.append([])
+            for channel in range(totalOutputChannels[idx - 1]):
+                inputChannelCompletionTimes[idx - 1].append([])
+                
+            inputChannelStartTimes.append([])
+            for channel in range(totalOutputChannels[idx - 1]):
+                inputChannelStartTimes[idx - 1].append([])
 
-mem = memory()
+inputChannelsCompleted.append(0)
+totalInputChannels.append(totalOutputChannels[-1])
+
+# class BRAMPrimitive:
+    
+#     def __init__(self, storage):
+#         self.storage = storage
+#         self.memory = np.array(storage, dtype=np.uint8)
+        
+        
+# class BRAM:
+    
+#     def __init__(self, storage, throughput):
+#         self.storage = storage #This is in bytes, should be 36,864 / 8 * 50 = 230400
+#         self.throughput = throughput #This is in operations/clk cycle. AKA, how many reads or writes can we do per cycle
 
 class DWCV:
     
@@ -131,13 +79,18 @@ class DWCV:
         self.dwcvCounter = 0
         self.dwcvActive = []
         self.layerWorkingOn = -1
-    
+        # Format is layer, input channel
+        self.pingLayerWeights = (-1, -1)
+        self.pongLayerWeights = (-1, -1)
+            
     def updateActivity(self):
         if(self.dwcvCounter > 0):
             self.dwcvActive.append(1)
             self.dwcvCounter -= 1
             if(self.dwcvCounter == 0):
                 inputChannelsCompleted[self.layerWorkingOn] += 1
+                inputChannelCompletionTimes[self.layerWorkingOn - 1].append(clkCycles)
+                
                 if(inputChannelsCompleted[self.layerWorkingOn] % 32 == 0):
                     dwcvCreated32.append(clkCycles)
                 self.layerWorkingOn = -1
@@ -145,12 +98,15 @@ class DWCV:
             self.dwcvActive.append(0)
     
     def startWorking(self, clockCycles, layer):
-        if(mem.contains(layer - 1, inputChannelsUsedDWCV[layer - 1]) != 9):
-            RuntimeError("Error: Depthwise Convolution was attempted to start without kernel loaded")
+        
+        # if(self.getPingLayer() != (layer, inputChannelsUsedDWCV[layer - 1])):
+        #     RuntimeError("Error: Depthwise Convolution was attempted to start without kernel loaded")
+        #     return 
             
         self.dwcvCounter = clockCycles
         self.layerWorkingOn = layer
         inputChannelsUsedDWCV[layer - 1] += 1
+        inputChannelStartTimes[self.layerWorkingOn - 1].append(clkCycles)
         for idx in range(9):
             itemsToRemove.append((layer - 1, inputChannelsUsedDWCV[layer - 1], 0))
         
@@ -162,6 +118,19 @@ class DWCV:
         
     def getActivity(self):
         return self.dwcvActive
+    
+    def getPingLayer(self):
+        return self.pingLayerWeights
+    
+    def getPongLayer(self):
+        return self.pongLayerWeights
+    
+    def pingToPong(self):
+        self.pongLayerWeights = self.pingLayerWeights
+        self.pingLayerWeights = -1
+    
+    def setPingLayerWeight(self, layer, inputChannel):
+        self.pingLayerWeights = (layer, inputChannel)
         
 class PWCV:
     
@@ -171,6 +140,12 @@ class PWCV:
         self.layerWorkingOn = -1
         self.numPWCV = numPWCV
         self.inputChannelsWorkingOn = []
+        
+        # Format is layer, layer/input channel/input channel from previous layer
+        # Also, all weights are loaded in groups of 32. So the input channel signifies what block of 32 weights we are
+        # doing. The input channel from previous layer signifies which block of 32 we are using there
+        # self.pingLayerWeights = (-1, -1, -1)
+        # self.pongLayerWeights = (-1, -1, -1)
     
     def updateActivity(self):
         if(self.pwcvCounter > 0):
@@ -181,23 +156,29 @@ class PWCV:
                 if(all(inputChannelsUsedPWCV[self.layerWorkingOn - 1][inputChannel] == totalInputChannels[self.layerWorkingOn - 1] for inputChannel in self.inputChannelsWorkingOn)):
                     inputChannelsCompleted[self.layerWorkingOn] += 32 # Since PWCV unit works on batches of 32 in parallel
                     pwcvCreated32.append(clkCycles)
+                
+                for inputChannel in self.inputChannelsWorkingOn:
+                    inputChannelCompletionTimes[self.layerWorkingOn - 1][inputChannel].append(clkCycles)
+                
                 self.layerWorkingOn = -1
                 self.inputChannelsWorkingOn = []
         else:
             self.pwcvActive.append(0)
     
     def startWorking(self, clockCycles, layer, inputChannels):
-        for inputChannel in inputChannels:
-            if(mem.contains(layer - 1, inputChannel, (inputChannelsUsedPWCV[layer - 1][inputChannel] + 32) // 32) != 32):
-                RuntimeError("Error: Pointwise Convolution was attempted to start without kernel loaded")
+        # for inputChannel in inputChannels:
+        #     if(mem.contains(layer - 1, inputChannel, (inputChannelsUsedPWCV[layer - 1][inputChannel] + 32) // 32) != 32):
+        #         RuntimeError("Error: Pointwise Convolution was attempted to start without kernel loaded")
         
         self.pwcvCounter = clockCycles//self.numPWCV
         self.layerWorkingOn = layer
         self.inputChannelsWorkingOn = inputChannels #inputChannels is a list of input channels the PWCV unit is working on concurrently
+        
         for inputChannel in inputChannels:
             for idx in range(32):
                 itemsToRemove.append((layer, inputChannel, (inputChannelsUsedPWCV[layer - 1][inputChannel] + 32) // 32))
             inputChannelsUsedPWCV[layer - 1][inputChannel] += 32
+            inputChannelStartTimes[self.layerWorkingOn - 1][inputChannel].append(clkCycles)
         
         
     def isActive(self):
@@ -209,8 +190,20 @@ class PWCV:
     def getActivity(self):
         return self.pwcvActive
     
+    def getPingLayer(self):
+        return self.pingLayerWeights
+    
+    def getPongLayer(self):
+        return self.pongLayerWeights
+    
+    def pingToPong(self):
+        self.pongLayerWeights = self.pingLayerWeights
+        self.pingLayerWeights = -1
+    
+    def setPingLayerWeight(self, layer, inputChannel1, inputChannel2):
+        self.pingLayerWeights = (layer, inputChannel1, inputChannel2)
+    
 
-clkCycles = 0
 inputChannelsCompleted[0] = totalInputChannels[0] # Should be 32, assume all input channels have been finished by standard convolution
 layerWorkingOn = 1
 completedLayers = [] # Number of clock cycles at which layers got completed
@@ -226,7 +219,7 @@ for clkCycles in range(totalTime):
         for idx in range(1, len(inputChannelsCompleted)):
             if(inputChannelsCompleted[idx] < totalInputChannels[idx] and inputChannelsCompleted[idx - 1] > inputChannelsUsedDWCV[idx - 1]):
                 if(layerType[idx - 1] == "Depthwise"):
-                    dwcvUnit.startWorking((timeToOutput[idx - 1]/totalInputChannels[idx]), idx)
+                    dwcvUnit.startWorking(3 * (spatialSize[idx - 1] * spatialSize[idx - 1]) // stride[idx-1], idx)
     
     if(not pwcvUnits.isActive()):
         for idx in range(1, len(inputChannelsCompleted)):
@@ -242,19 +235,24 @@ for clkCycles in range(totalTime):
                             condition = condition and False
                             break
                     if condition is True:
-                        pwcvUnits.startWorking(timeToOutput[idx-1]/(totalInputChannels[idx]/32) * (1/(totalInputChannels[idx-1]/32)), idx, channelsWorkingOn)
+                        # pwcvUnits.startWorking(timeToOutput[idx-1]/(totalInputChannels[idx]/32) * (1/(totalInputChannels[idx-1]/32)), idx, channelsWorkingOn)
+                        pwcvUnits.startWorking(96 * (spatialSize[idx - 1] * spatialSize[idx - 1]), idx, channelsWorkingOn)
                         break
                 break #We can stop on the first condition this is true
 
     dwcvUnit.updateActivity()
     pwcvUnits.updateActivity()
     
-    if(inputChannelsCompleted[layerWorkingOn] == totalInputChannels[layerWorkingOn]):
-        completedLayers.append(clkCycles)
-        layerWorkingOn += 1
-        
     if(layerWorkingOn == len(inputChannelsCompleted)):
         break
+    
+    try:
+        if(inputChannelsCompleted[layerWorkingOn] == totalInputChannels[layerWorkingOn]):
+            completedLayers.append(clkCycles)
+            layerWorkingOn += 1
+    except:
+        print("layerWorkingOn is " + str(layerWorkingOn))
+            
         
     if clkCycles % 10000 == 0:
         print("Cycle: ", clkCycles)
@@ -287,3 +285,60 @@ print("It took " + str(clkCycles) + " clock cycles to finish")
 
 print("The number of clock cycles between the last two PWCV finishing 32 is: " + str(pwcvCreated32[-1] - pwcvCreated32[-2]))
 print("The number of clock cycles between the last two PWCV weight switches is: " + str(pwcvFinishedWork[-1] - pwcvFinishedWork[-2]))
+
+# for idx in range(len(inputChannelCompletionTimes)):
+#     if(layerType[idx] == "Depthwise"):
+#         print("Depthwise layer:")
+#         for jdx in range (len(inputChannelCompletionTimes[idx])):
+#             print(f"Time taken to use output channel {jdx} of layer {idx}: {inputChannelCompletionTimes[idx][jdx]}")
+#     if(layerType[idx] == "Pointwise"):
+#         print("Pointwise layer:")
+#         for jdx in range (len(inputChannelCompletionTimes[idx])):
+#             for ic in range (len(inputChannelCompletionTimes[idx][jdx])):
+#                 print(f"Time taken to use output channel {ic} of layer {idx} to create input channel {jdx}: {inputChannelCompletionTimes[idx][jdx]}")
+
+import json
+
+# Build a structured object that matches your data
+payload = []
+for idx in range(len(inputChannelCompletionTimes)):
+    lt = layerType[idx]
+
+    if lt == "Depthwise":
+        payload.append({
+            "layer": idx,
+            "type": "Depthwise",
+            "res": int(spatialSize[idx]),
+            "channels": [
+                {
+                    "out_ch": jdx,
+                    "starts": inputChannelStartTimes[idx][jdx],
+                    "ends":   inputChannelCompletionTimes[idx][jdx],
+                }
+                for jdx in range(len(inputChannelCompletionTimes[idx]))
+            ],
+        })
+
+    elif lt == "Pointwise":
+        payload.append({
+            "layer": idx,
+            "type": "Pointwise",
+            "res": int(spatialSize[idx]),
+            "out_channels": [
+                {
+                    "out_ch": jdx,
+                    "in_channels": [
+                        {
+                            "in_ch": ic,
+                            "starts": inputChannelStartTimes[idx][jdx][ic],
+                            "ends":   inputChannelCompletionTimes[idx][jdx][ic],
+                        }
+                        for ic in range(len(inputChannelCompletionTimes[idx][jdx]))
+                    ],
+                }
+                for jdx in range(len(inputChannelCompletionTimes[idx]))
+            ],
+        })
+
+with open("mobilenet_timeline.json", "w") as f:
+    json.dump(payload, f)
