@@ -2,10 +2,10 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 
-totalTime = 4999200
+totalTime = 4999200 * 2
 df = pd.read_excel('ThroughputCalcV2.xlsx')
 
-totalTime = int(df["Time to output (CLK CYCLES)"][55])
+totalTime = int(df["Time to output (CLK CYCLES)"][55]) * 4
 
 print("total time is " + str(totalTime))
 
@@ -62,11 +62,11 @@ for idx, row in df.iterrows():
 inputChannelsCompleted.append(0)
 totalInputChannels.append(totalOutputChannels[-1])
 
-# class BRAMPrimitive:
+class BRAMPrimitive:
     
-#     def __init__(self, storage):
-#         self.storage = storage
-#         self.memory = np.array(storage, dtype=np.uint8)
+    def __init__(self, storage):
+        self.storage = storage
+        self.memory = np.array(storage, dtype=np.uint8)
         
         
 # class BRAM:
@@ -217,14 +217,12 @@ completedLayers.append(0)
 dwcvUnit = DWCV()
 pwcvUnits = PWCV(8)
 
-# totalTime = 1250000 * 2
-
 for clkCycles in range(totalTime):
     if(not dwcvUnit.isActive()):
         for idx in range(1, len(inputChannelsCompleted)):
             if(inputChannelsCompleted[idx] < totalInputChannels[idx] and inputChannelsCompleted[idx - 1] > inputChannelsUsedDWCV[idx - 1]):
                 if(layerType[idx - 1] == "Depthwise"):
-                    dwcvUnit.startWorking(3 * (spatialSize[idx - 1] * spatialSize[idx - 1]) // stride[idx-1], idx)
+                    dwcvUnit.startWorking((spatialSize[idx - 1] * spatialSize[idx - 1]) // stride[idx-1], idx)
     
     if(not pwcvUnits.isActive()):
         for idx in range(1, len(inputChannelsCompleted)):
@@ -241,7 +239,7 @@ for clkCycles in range(totalTime):
                             break
                     if condition is True:
                         # pwcvUnits.startWorking(timeToOutput[idx-1]/(totalInputChannels[idx]/32) * (1/(totalInputChannels[idx-1]/32)), idx, channelsWorkingOn)
-                        pwcvUnits.startWorking(24 * (spatialSize[idx - 1] * spatialSize[idx - 1]), idx, channelsWorkingOn)
+                        pwcvUnits.startWorking(8 * (spatialSize[idx - 1] * spatialSize[idx - 1]), idx, channelsWorkingOn)
                         break
                 break #We can stop on the first condition this is true
 
@@ -249,6 +247,7 @@ for clkCycles in range(totalTime):
     pwcvUnits.updateActivity()
     
     if(layerWorkingOn == len(inputChannelsCompleted)):
+        print("Layer working on is " + str(layerWorkingOn) + " and len(inputChannelsCompleted) is " + str(len(inputChannelsCompleted)))
         break
     
     try:
@@ -265,6 +264,8 @@ for clkCycles in range(totalTime):
         print("dwcv.isActive(): ", dwcvUnit.isActive())
         print("pwcv count: ", pwcvUnits.pwcvCounter)
         print("dwcv count: ", dwcvUnit.dwcvCounter)
+
+print("Layer working on is " + str(layerWorkingOn) + " and len(inputChannelsCompleted) is " + str(len(inputChannelsCompleted)))
 
 dwcvActivity = dwcvUnit.getActivity()
 pwcvActivity = pwcvUnits.getActivity()
