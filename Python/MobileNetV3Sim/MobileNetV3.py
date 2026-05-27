@@ -23,6 +23,8 @@ channelsIn = np.zeros(layers, dtype=int)
 channelsOut = np.zeros(layers, dtype=int)
 spatialSize = np.zeros(layers, dtype=int)
 squeezeExcite = np.zeros(layers, dtype=int)
+SEhiddenLayer = np.zeros(layers, dtype=int)
+SRAMStartIndex = np.zeros(layers, dtype=int)
 clkCycles = 0
 
 clockHz = 300000000 # 300 MHZ Clock speed
@@ -42,8 +44,10 @@ for idx, row in df.iterrows():
         spatialSize[idx] = int(row["Spatial"])
         if(row["SE"] == "Yes"):
             squeezeExcite[idx] = 1
+            SEhiddenLayer[idx] = int(row["SE Hidden Layer"])
         else:
             squeezeExcite[idx] = 0
+        SRAMStartIndex[idx] = int(row["SRAM Activation Start Index"])
 
 
 DEPTHWISE_KERNEL_PARTS = 9
@@ -73,8 +77,16 @@ class PointwiseWeight:
 class PointwiseKernel:
     type: Literal["pointwise"] = field(default="pointwise", init=False)
     layer: int = -1
-    channel: int = -1
-    channelGroup: int = -1 # This is // 9
+    channel: int = -1 # This is the output channel
+    channelGroup: int = -1 # This is the input channel chunk
+
+@dataclass
+class SEWeight:
+    type: Literal["SEWeight"] = field(default="SEWeight", init=False)
+    matrix: Literal["squeeze", "excite"]
+    layer: int = -1
+    row: int = -1
+    column: int = -1
 
 @dataclass
 class FullyConnectedWeight:
@@ -86,6 +98,7 @@ class FullyConnectedWeight:
 Weight = Union[
     DepthwiseWeight,
     PointwiseWeight,
+    SEWeight,
     FullyConnectedWeight,
 ]
 
@@ -93,7 +106,8 @@ Kernel = Union[
     DepthwiseKernel,
     PointwiseKernel
 ]
-    
+
+# Channel argument refers to the input channel
 @dataclass
 class Activation:
     type: ActivationType
@@ -108,7 +122,8 @@ class ActivationChunk:
     layer: int = -1
     x: int = -1
     y: int = -1
-    channelChunk: int = -1   # This is // 9
+    channel: int = -1
+    channelChunk: int = -1   # For pointwise it represents the lowest channel. 
 
 @dataclass
 class PartialActivation:
@@ -141,14 +156,14 @@ class DepthwiseConvOperation:
 
 @dataclass
 class CameraDepthwiseConvOperation:
-    type: Literal["depthwise"]
+    type: Literal["depthwise"] = field(default="depthwise", init=False)
     tag: int
     targetX: int
     targetY: int
-    xOffset: int = -1
-    yOffset: int = -1
     nextToLoad: int = 0
     nextToRead: int = 0
+    nextToTrigger: int = 0
+    activationsLoaded: bool = False
 
 @dataclass
 class PointwiseConvOperation:
@@ -184,9 +199,8 @@ class SRAM:
         self.lastReadClockCycle = -1
         self.lastWriteClockCycle = -1
         
-        self.memory = np.empty(self.addresses, dtype=[('a', object), ('b', object)])
-        self.memory['a'] = None
-        self.memory['b'] = None
+        self.memory = np.empty((self.addresses, SE_WEIGHTS_PER_SRAM_ADDRESS), dtype=object)
+        self.memory[:] = None
         
 
     def isActiveRead(self):
@@ -323,7 +337,7 @@ class camera:
     def startImage(self):
         self.capturing = True
         self.clockCounter = 30
-        self.pixelCounter = 0
+        self.pixelCounter = -1
     
     def updateCamera(self):
         if (self.capturing):
@@ -332,7 +346,7 @@ class camera:
                 self.clockCounter = 30
                 self.pixelCounter += 1
                 
-            if (self.pixelCounter >= self.width * self.height):
+            if (self.pixelCounter >= (self.width * self.height - 1)):
                 self.capturing = False
     
     def isCapturing(self):
@@ -359,7 +373,7 @@ class camera:
         assert (y >= 0 and y < self.height), "ERROR! Activation y coordinate is outside the camera height"
 
         pixelIndex = self.xyToPixelCounter(x, y)
-        assert (self.pixelCounter > pixelIndex), "ERROR! Camera has not captured enough pixels for this activation to exist"
+        assert (self.pixelCounter >= pixelIndex), f"ERROR! Camera has not captured enough pixels for this activation to exist. pixelCounter={self.pixelCounter}, pixelIndex={pixelIndex}"
 
         return Activation("depthwise", 0, x, y, 0)
 
@@ -373,9 +387,9 @@ class DSPunit:
         
         self.preloadedKernel = DepthwiseKernel()
         
-        self.activationChunk = ActivationChunk()
+        self.activationChunk = ActivationChunk(type="Depthwise")
         
-        self.preloadedActivationChunk = ActivationChunk()
+        self.preloadedActivationChunk = ActivationChunk(type="Depthwise")
         
         # Amount of time it takes until it has multiplied all together. When self.timer == 0, it is finished
         self.timer = -1
@@ -395,15 +409,40 @@ class DSPunit:
     
     def loadKernel(self):
         self.kernel = replace(self.preloadedKernel)
+        if (isinstance(self.kernel, PointwiseKernel)):
+            print(f"""kernel:
+                channel: {self.kernel.channelGroup}
+                layer: {self.kernel.layer}
+                type: {self.kernel.type}""")
+        else:
+            print(f"""kernel:
+                channel: {self.kernel.channel}
+                layer: {self.kernel.layer}
+                type: {self.kernel.type}""")
     
     def preloadActivation(self, activationChunk: ActivationChunk):
         self.preloadedActivationChunk = activationChunk
         
     def loadActivation(self):
         self.activationChunk = replace(self.preloadedActivationChunk)
+        print(f"""activationChunk:
+              channel: {self.activationChunk.channel}
+              layer: {self.activationChunk.layer}
+              type: {self.activationChunk.type}""")
         
     def startDotProduct(self):
-        if(self.activationChunk.layer != self.kernel.layer or self.activationChunk.channel != self.kernel.channel or self.activationChunk.type != self.kernel.type):
+        if (isinstance(self.kernel, PointwiseKernel)):
+            expectedActivationChannel = self.kernel.channelGroup * POINTWISE_KERNEL_PARTS
+        else:
+            expectedActivationChannel = self.kernel.channel
+
+        if(self.activationChunk.layer != self.kernel.layer or self.activationChunk.channel != expectedActivationChannel or self.activationChunk.type != self.kernel.type):
+            if (self.activationChunk.layer != self.kernel.layer):
+                print(f"Mismatched layer! Activation layer: {self.activationChunk.layer}, Kernel layer: {self.kernel.layer}\n")
+            if (self.activationChunk.channel != expectedActivationChannel):
+                print(f"Mismatched channel! Activation channel: {self.activationChunk.channel}, kernel channel: {expectedActivationChannel}\n")
+            if (self.activationChunk.type != self.kernel.type):
+                print(f"Mismatched type! Activation type: {self.activationChunk.type}, kernel type: {self.kernel.type}\n")
             raise Exception("ERROR! DSP slice started with mismatched weight and activation")
         elif (self.isActive()):
             raise Exception("ERROR! DSP Slice attempted to start while already being active!")
@@ -418,7 +457,7 @@ class DSPunit:
                 else:
                     if (self.accumulatedX != self.activationChunk.x or self.accumulatedY != self.activationChunk.y):
                         raise Exception("ERROR! DSP slice accumulating at different coordinate than where it started")
-                self.accumulatedChannels.append(self.kernel.channel)
+                self.accumulatedChannels.append(self.kernel.channelGroup)
             else:
                 if (len(self.accumulatedChannels) != 0):
                     raise Exception("Accummulator not cleared before depthwise convolution started")
@@ -434,15 +473,39 @@ class DSPunit:
         return (self.timer > 0)
     
     def getOutput(self):
-        
         if (self.isActive()):
             raise Exception("ERROR! Activation was attempted to be taken from active DSP slice")
         else:
-            copiedAccumulatedChannels = self.accumulatedChannels.copy()
-            toReturn = [self.kernel.type, self.accumulatedX, self.accumulatedY, copiedAccumulatedChannels]
-            self.accumulatedChannels.clear()
-            self.accumulatedX = -1
-            self.accumulatedY = -1
+            if (self.kernel.type == "depthwise"):
+                toReturn = Activation(
+                    type="depthwise",
+                    layer=self.kernel.layer,
+                    x=self.activationChunk.x,
+                    y=self.activationChunk.y,
+                    channel=self.kernel.channel)
+            else:
+                accumulatedChannelSet = set(self.accumulatedChannels)
+                usedAllChannels = len(accumulatedChannelSet) == channelsIn[self.kernel.layer]
+
+                if (usedAllChannels):
+                    toReturn = Activation(
+                        type="pointwise",
+                        layer=self.kernel.layer,
+                        x=self.accumulatedX,
+                        y=self.accumulatedY,
+                        channel=self.kernel.channel)
+                else:
+                    toReturn = PartialActivation(
+                        layers=[self.kernel.layer],
+                        x=self.accumulatedX,
+                        y=self.accumulatedY,
+                        segment=self.activationChunk.channelChunk,
+                        outputChannel=self.kernel.channel)
+
+                self.accumulatedChannels.clear()
+                self.accumulatedX = -1
+                self.accumulatedY = -1
+
             return toReturn
     
     def setOperationTag(self, operationTag):
@@ -473,7 +536,7 @@ class DSPmanager:
         self.tagCounter = 0
     
     def getFreeDSPunits(self, max=None):
-        freeDSPs = [dsp for dsp in self.DSPlist if not dsp.isActive()]
+        freeDSPs = [dsp for dsp in self.DSPlist if (not dsp.isActive() and dsp.getOperationTag() is None)]
         if (max is None):
             return freeDSPs
         if (max < 0):
@@ -505,26 +568,26 @@ class DSPmanager:
         return len(self.operationFIFO)
     
     def startDepthwiseConvFromCamera(self, targetX, targetY, camera: camera):
-        pixelCounter = camera.pixelNumber()
-        pixelCoords = camera.pixelCounterToXY(pixelCounter)
-        pixelX = pixelCoords[0]
-        pixelY = pixelCoords[1]
-        
-        if (targetY >= pixelY):
+        lastNeededX = min(targetX + 1, camera.width - 1)
+        lastNeededY = min(targetY + 1, camera.height - 1)
+        lastNeededPixel = camera.xyToPixelCounter(lastNeededX, lastNeededY)
+
+        if (camera.pixelNumber() < lastNeededPixel):
             raise Exception("ERROR! Camera pixel counter not advanced enough to do depthwise convolution")
-        
-        if (targetY + 1 == pixelY):
-            if (targetX >= pixelX):
-                raise Exception("ERROR! Camera pixel counter not advanced enough to do depthwise convolution")
         
         # Since layer 0 is where the camera output gets turned to 16 channels
         freeDSPs = self.getFreeDSPunits(channelsOut[0])
+        
+        if (len(freeDSPs) != channelsOut[0]):
+            return False
         
         self.assignOperationTag(freeDSPs, self.tagCounter)
         depthwiseConvOp = CameraDepthwiseConvOperation(tag=self.tagCounter, targetX=targetX, targetY=targetY)
         self.tagCounter += 1
         
         self.fifoPush(depthwiseConvOp)
+        
+        return True
 
     # I am going to go to the gym now, but what I need to do next is have a function which updates the DSPmanager,
     # meaning that the next operation is performed / updated. And then discarded when finished. That same function
@@ -538,109 +601,104 @@ class DSPmanager:
         operation = self.fifoPeek()
         
         # Depthwise convolutions go left to right, top to bottom
+        INITIAL_CONVOLUTION_K = 3
         if isinstance(operation, CameraDepthwiseConvOperation):
-            cameraActivation = imxCamera.getActivation(operation.targetX + operation.xOffset, operation.targetY + operation.yOffset)
+            cameraActivationList = []
+            for height in range(INITIAL_CONVOLUTION_K):
+                for width in range(INITIAL_CONVOLUTION_K):
+                    activationX = operation.targetX + (width - 1)
+                    activationY = operation.targetY + (height - 1)
+                    if (activationX < 0 or activationX >= imxCamera.width):
+                        continue
+                    if (activationY < 0 or activationY >= imxCamera.height):
+                        continue
+                    cameraActivation = imxCamera.getActivation(activationX, activationY)
+                    cameraActivationList.append(cameraActivation)
+            activationChunk = memory.activationToActivationChunk(cameraActivationList)
             
             DSPunits = self.getDSPsWithOpTag(operation.tag)
             
-            if (len(DSPunits) != 16):
-                raise Exception("Camera Depthwise Conv Op attempted without 16 DSP units")
+            if (operation.activationsLoaded == False):
+                channel = 0
+                for DSPunit in DSPunits:
+                    DSPActivationChunk = replace(activationChunk, channel=channel)
+                    DSPunit.preloadActivation(DSPActivationChunk)
+                    channel += 1
+                operation.activationsLoaded = True
             
-            channel = 0
-            for DSPfromList in DSPunits:
-                partFromOp = operation.xOffset + operation.yOffset * 3
-                
-                desiredWeight = DepthwiseWeight(layer=0, channel=channel, part=partFromOp)
-
-                desiredActivation = Activation(type="depthwise", layer=0, x=cameraActivation.x, y=cameraActivation.y)
-                
-                # I actually think this is a bad way of doing this... Because, you have to do
-                # a bunch of dumb stuff. Like if you did this in hardware, you have to have each
-                # DSPunit have metadata about what activation and weight it has loaded, and then
-                # the DSPmanager has to interrogate each DSPunit to make sure it has the right stuff...
-                # Too much complexity, too much data
-                
-                # Instead, what I think should happen is each operation should have an array of bits.
-                # We need to be able to query the memory manager and ask, if I ask you for this weight,
-                # will you be able to get it to me in the next clock cycle?
-                
-                # Even better, we convert the weight into an LRAM, and then see if that LRAM is currently in
-                # use this cycle. This is best because it parallels the way you do it in hardware. The
-                # memory manager just sends back some LRAMUSED signals, and then the DSPmanager uses
-                # those to determine which DSPs it can load with weights
-                
-                # But, the answer is even more complex than that, because, there are multiple weights packed per LRAM
-                # read.
-                # Low key, what if I make each depthwise convolution kernel only 8 weights. So it looks like
-                # 1 1 1
-                # 1 1 1
-                # 1 1 0
-                # That way, it fits cleanly into two LRAM reads, and makes life easier.
-                # Ok, actually, I think it's better to have 9 activations per kernel for a really specific reason.
-                # It's because there's only 5 LRAMs to begin with. So even if you could fit 1 kernel per 2 SRAMs,
-                # you will still only be able to read 2 kernels at a time, since 3 reads would require
-                # 2 * 3 = 6 simultaneous SRAM reads which is not possible. So either way, you are still limited to 2 kernel
-                # reads per cycle.
-                #
-                # So actually, I think the best way for this to be is for the memory manager to send a signal signifying
-                # that the amount of weights it has on its plate for this cycle has completely used up all LRAMs, OR
-                # that the next kernel spans across a busy LRAM, so it's useless to even request another weight
-                # of course, that LRAM will still be read, and its result will be cached by the memory manager.
-                #
-                # So then, the DSPmanager will be loading weights from the lowest channel to the highest, to match
-                # what the LRAMs already have stored. Actually, since we know the kernels will be loaded sequentially, instead
-                # of having an array of bits for each kernel, we can have an int which basically acts as a pointer to the
-                # next available DSPUnit we can load. Then, we have a similar pointer for the activations coming out, so 
-                # we can keep track of our progress on the operation on two fronts
-                #
-                # Since we can read a kernel in one cycle, I think it makes sense to have each DSP unit to have enough internal
-                # storage to store 9 weights. But then one is wasted during pointwise convolution. What I can do, actually,
-                # is round all channel numbers to be divisible by 9 instead of divisible by 8. That's a pretty easy solution. And
-                # IMO it's better than making a kernel a non-square shape.
-                #
-                # We have 320 Kbits of distributed RAM, which I am assuming means flip flop storage. So if that's the case,
-                # I think it makes sense to store a kernel per DSP unit since it only takes 2 KBits of Flip flop storage total
-                #
-                # The only thing, is that if we do decide to round up to 9, then one pointwise "mini-kernel" will take three reads
-                # from SRAM. The thing is, there's no globally optimized solution. It's either that we waste one "mini-kernel"
-                # byte per "exchange" with the DSPUnit, or we waste half of an SRAM read. I think wasting half of an SRAM read
-                # is smarter.
-                #
-                # Ok, so I kind of lost the plot... what's the idea? ==> The idea is: store everything differently and match
-                # the hardware instead of what I'm doing now which is dumb
-                #
-                # So I need to add a function to the memory manager called askForKernel(), and passes in a bunch of DSP
-                # units. And then the memory manager promises that, on the next cycle, it will read from memory and feed
-                # it's signal to all of the DSPUnits in the list. ONLY if it returns true. If it returns false, then
-                # it basically says I cant do that my LRAMS are too busy. Also the memoryManager should cache its old
-                # read if it reads one LRAM and it has parts of two different kernels that way we can use the same
-                # LRAM next time we want to read
-                #
-                # I also need to add a function in memoryManager that allows it to "transform" a bunch of weight datatypes
-                # into a kernel datatype. This has no meaning in hardware, but in software it just allows us to see more
-                # easily about what we are doing.
-                
-                channel += 1
+            if (len(DSPunits) != channelsOut[0]):
+                raise Exception("Camera Depthwise Conv Op attempted without 18 DSP units")
+            
+            if (operation.nextToRead == channelsOut[0]):
+                for DSPunit in DSPunits:
+                    DSPunit.setOperationTag(None)
+                self.fifoPop()
+                return
+            
+            if (operation.nextToRead < operation.nextToTrigger):
+                for channel in range(operation.nextToRead, operation.nextToTrigger):
+                    DSPtoRead = DSPunits[channel]
+                    
+                    if (DSPtoRead.isActive() == True):
+                        break
+                    
+                    if (DSPtoRead.isActive() == False):
+                        # Load activation from DSP to SRAM
+                        if (memory.loadActivationFromDSP(DSPtoRead) == False):
+                            break
+                        
+                        operation.nextToRead += 1
+            
+            if (operation.nextToTrigger < operation.nextToLoad):
+                for channel in range(operation.nextToTrigger, operation.nextToLoad):
+                    DSPtoTrigger = DSPunits[channel]
+                    
+                    if (DSPtoTrigger.isActive()):
+                        break
+                    
+                    DSPtoTrigger.loadKernel()
+                    DSPtoTrigger.loadActivation()
+                    DSPtoTrigger.startDotProduct()
+                    operation.nextToTrigger += 1
+            
+            if (operation.nextToLoad != channelsOut[0]):
+                for channel in range(operation.nextToLoad, channelsOut[0]):
+                    
+                    desiredKernel = DepthwiseKernel(layer=0, channel=channel)
+                    
+                    result = memory.askForKernel(desiredKernel, DSPunits[channel].getID())
+                    
+                    if (result == False):
+                        break
+                    
+                    operation.nextToLoad += 1
+    
+    def update(self):
+        self.processOperation()
 
 DSPMngr = DSPmanager()
 
+
 NUM_LRAMS = 5
+NUM_SRAMS = 166
 MAX_SIMULTANEOUS_LRAM_WRITES = NUM_LRAMS
+MAX_SIMULTANEOUS_SRAM_WRITES = NUM_SRAMS
 
 WEIGHTS_PER_LRAM_ADDRESS = 4
+SE_WEIGHTS_PER_SRAM_ADDRESS = 2
 class memoryManager:
     
     #SRAM will be used for activation, and LRAM for weight
     def __init__(self):
         
         self.allSRAM = []
-        self.numSRAM = 166
+        self.numSRAM = NUM_SRAMS
 
         for idx in range(self.numSRAM):
             self.allSRAM.append(SRAM())
 
         self.allLRAM = []
-        self.numLRAM = 5
+        self.numLRAM = NUM_LRAMS
 
         for idx in range(self.numLRAM):
             self.allLRAM.append(LRAM())
@@ -648,9 +706,12 @@ class memoryManager:
         # This is for loading the weights
         self.weightIndexCount = 0
         self.weightPack = []
+        self.SEWeightIndexCount = 0
+        self.SEWeightPack = []
         
         # This is for finding weights
         self.startOfLayer = np.zeros((layers, 3), dtype=int)
+        self.startOfSELayer = np.zeros((layers, 3), dtype=int)
     
     # This function takes a list of DSPunits and a list of weights, and loads the DSP units with weights as efficiently as possible
     def loadWeightsToDSP(self, DSPunits, weightList):
@@ -678,6 +739,20 @@ class memoryManager:
         
         self.weightIndexCount += 1
         self.weightPack.clear()
+
+    def loadSEWeightsInStart(self, weight: SEWeight):
+        # Pack two squeeze/excite weights into one SRAM address.
+        self.SEWeightPack.append(weight)
+        if (len(self.SEWeightPack) < SE_WEIGHTS_PER_SRAM_ADDRESS):
+            return
+
+        sramNum = self.SEWeightIndexCount % self.numSRAM
+        sramAddr = self.SEWeightIndexCount // self.numSRAM
+
+        self.allSRAM[sramNum].writeSRAM(sramAddr, self.SEWeightPack.copy())
+
+        self.SEWeightIndexCount += 1
+        self.SEWeightPack.clear()
     
     # Returns the next available LRAM, address, and packed position while loading.
     def getLRAMIndexLoading(self) -> tuple[int, int, int]:
@@ -691,6 +766,19 @@ class memoryManager:
         self.startOfLayer[layer][0] = layerStartPosition[0] # LRAM Num
         self.startOfLayer[layer][1] = layerStartPosition[1] # LRAM Addr
         self.startOfLayer[layer][2] = layerStartPosition[2] # Packed Position
+
+    # Returns the next available SRAM, address, and packed position while loading.
+    def getSRAMIndexLoading(self) -> tuple[int, int, int]:
+        sramNum = self.SEWeightIndexCount % self.numSRAM
+        sramAddr = self.SEWeightIndexCount // self.numSRAM
+        packedPosition = len(self.SEWeightPack)
+        return (sramNum, sramAddr, packedPosition)
+
+    def markSELayerStart(self, layer):
+        layerStartPosition = self.getSRAMIndexLoading()
+        self.startOfSELayer[layer][0] = layerStartPosition[0] # SRAM Num
+        self.startOfSELayer[layer][1] = layerStartPosition[1] # SRAM Addr
+        self.startOfSELayer[layer][2] = layerStartPosition[2] # Packed Position
 
     def flushWeightsInStart(self):
         if (len(self.weightPack) == 0):
@@ -706,6 +794,21 @@ class memoryManager:
         
         self.weightIndexCount += 1
         self.weightPack.clear()
+
+    def flushSEWeightsInStart(self):
+        if (len(self.SEWeightPack) == 0):
+            return
+
+        while (len(self.SEWeightPack) < SE_WEIGHTS_PER_SRAM_ADDRESS):
+            self.SEWeightPack.append(None)
+
+        sramNum = self.SEWeightIndexCount % self.numSRAM
+        sramAddr = self.SEWeightIndexCount // self.numSRAM
+
+        self.allSRAM[sramNum].writeSRAM(sramAddr, self.SEWeightPack.copy())
+
+        self.SEWeightIndexCount += 1
+        self.SEWeightPack.clear()
     
     # Read from (LRAMNum, LRAMAddr, packedIndex), numReads sequentially
     def readSequentially(self, LRAMNum, LRAMAddr, packedIndex, numReads, weightsRead):
@@ -724,7 +827,7 @@ class memoryManager:
             if (LRAMobj.isCached(currentAddr)):
                 fullRead = LRAMobj.readLRAM(currentAddr)
             else:
-                if (LRAMobj.isActiveRead(currentAddr)):
+                if (LRAMobj.isActiveRead()):
                     return False
                 else:
                     fullRead = LRAMobj.readLRAM(currentAddr)
@@ -763,23 +866,107 @@ class memoryManager:
             return DepthwiseKernel(layer=firstWeight.layer, channel=firstWeight.channel)
 
         if (isinstance(firstWeight, PointwiseWeight)):
-            if (firstWeight.y % POINTWISE_KERNEL_PARTS != 0):
-                raise Exception("ERROR! Pointwise kernel must start at a y divisible by 9")
+            if (firstWeight.channel % POINTWISE_KERNEL_PARTS != 0):
+                raise Exception("ERROR! Pointwise kernel must start at an input channel divisible by 9")
 
             for idx, weight in enumerate(weightList):
                 if (not isinstance(weight, PointwiseWeight)):
                     raise Exception("ERROR! Cannot make kernel from mixed weight types")
-                if (weight.layer != firstWeight.layer or weight.channel != firstWeight.channel):
+                if (weight.layer != firstWeight.layer or weight.y != firstWeight.y):
                     raise Exception("ERROR! Pointwise weights are not in the same kernel")
-                if (weight.y != firstWeight.y + idx):
+                if (weight.channel != firstWeight.channel + idx):
                     raise Exception("ERROR! Pointwise weights are not sequential")
 
             return PointwiseKernel(
                 layer=firstWeight.layer,
-                channel=firstWeight.channel,
-                channelGroup=firstWeight.y // POINTWISE_KERNEL_PARTS)
+                channel=firstWeight.y,
+                channelGroup=firstWeight.channel // POINTWISE_KERNEL_PARTS)
 
         raise Exception("ERROR! Unsupported weight type for kernel conversion")
+    
+    def activationToActivationChunk(self, activationList: List[Activation]) -> ActivationChunk:
+        if (len(activationList) == 0):
+            raise Exception("ERROR! Cannot make activation chunk from empty activation list")
+        if (any(activation is None for activation in activationList)):
+            raise Exception("ERROR! Cannot make activation chunk from empty activation")
+
+        firstActivation = activationList[0]
+        if (any(activation.type != firstActivation.type for activation in activationList)):
+            raise Exception("ERROR! Cannot make activation chunk from mixed activation types")
+
+        if (firstActivation.type == "depthwise"):
+            layerKernelSize = kernelSize[firstActivation.layer]
+            kernelRadius = layerKernelSize // 2
+            layerSpatialSize = spatialSize[firstActivation.layer]
+
+            if (layerKernelSize != 3 and layerKernelSize != 5):
+                raise Exception("ERROR! Unsupported depthwise activation kernel size")
+
+            for activation in activationList:
+                if (activation.layer != firstActivation.layer or activation.channel != firstActivation.channel):
+                    raise Exception("ERROR! Depthwise activations are not in the same chunk")
+                if (activation.x < 0 or activation.x >= layerSpatialSize):
+                    raise Exception("ERROR! Depthwise activation x coordinate is outside the layer bounds")
+                if (activation.y < 0 or activation.y >= layerSpatialSize):
+                    raise Exception("ERROR! Depthwise activation y coordinate is outside the layer bounds")
+
+            activationCoordinates = [(activation.x, activation.y) for activation in activationList]
+            possibleTopLeftCoordinates = []
+            for topLeftY in range(firstActivation.y - layerKernelSize + 1, firstActivation.y + 1):
+                for topLeftX in range(firstActivation.x - layerKernelSize + 1, firstActivation.x + 1):
+                    expectedCoordinates = []
+                    for kernelY in range(layerKernelSize):
+                        for kernelX in range(layerKernelSize):
+                            expectedX = topLeftX + kernelX
+                            expectedY = topLeftY + kernelY
+                            if (expectedX < 0 or expectedX >= layerSpatialSize):
+                                continue
+                            if (expectedY < 0 or expectedY >= layerSpatialSize):
+                                continue
+                            expectedCoordinates.append((expectedX, expectedY))
+
+                    if (activationCoordinates == expectedCoordinates):
+                        possibleTopLeftCoordinates.append((topLeftX, topLeftY))
+
+            if (len(possibleTopLeftCoordinates) != 1):
+                raise Exception("ERROR! Depthwise activations are not in clipped row-major kernel order")
+
+            topLeftX = possibleTopLeftCoordinates[0][0]
+            topLeftY = possibleTopLeftCoordinates[0][1]
+
+            return ActivationChunk(
+                type=firstActivation.type,
+                layer=firstActivation.layer,
+                x=topLeftX + kernelRadius,
+                y=topLeftY + kernelRadius,
+                channel=firstActivation.channel)
+
+        if (firstActivation.type == "pointwise"):
+            if (len(activationList) != POINTWISE_KERNEL_PARTS):
+                raise Exception("ERROR! Pointwise activation chunk has incorrect number of activations")
+
+            lowestChannel = min(activation.channel for activation in activationList)
+            expectedChannels = set(range(lowestChannel, lowestChannel + len(activationList)))
+            actualChannels = {activation.channel for activation in activationList}
+            if (actualChannels != expectedChannels):
+                raise Exception("ERROR! Pointwise activations are not sequential")
+
+            for activation in activationList:
+                if (activation.layer != firstActivation.layer):
+                    raise Exception("ERROR! Pointwise activations are not in the same layer")
+                if (activation.x != firstActivation.x or activation.y != firstActivation.y):
+                    raise Exception("ERROR! Pointwise activations are not at the same coordinate")
+
+            return ActivationChunk(
+                type=firstActivation.type,
+                layer=firstActivation.layer,
+                x=firstActivation.x,
+                y=firstActivation.y,
+                channel=lowestChannel,
+                channelChunk=lowestChannel)
+
+        raise Exception("ERROR! Unsupported activation type for activation chunk conversion")
+    
 
     def askForKernel(self, kernel: Kernel, id):
         # We basically need to bridge the gap between the start of the layer and the
@@ -823,13 +1010,16 @@ class memoryManager:
             if (success == False):
                 return False
             
-            kernel = self.weightsToKernel(weights)
+            desiredKernel = kernel
+            returnedKernel = self.weightsToKernel(weights)
+            if (returnedKernel != desiredKernel):
+                raise Exception(f"ERROR! Memory returned the wrong kernel. Desired kernel: {desiredKernel}, returned kernel: {returnedKernel}")
             # Get DSPUnit by ID
             # Load kernel to DSPUnit
             
             dsp = DSPMngr.getDSPByID(id)
             
-            dsp.preloadKernel(kernel)
+            dsp.preloadKernel(returnedKernel)
         elif (isinstance(kernel, PointwiseKernel)):
             # I will implement this later, should be similar to code above, just need to add a check
             # for if it is at the part of the code where we store one half of a chunk near another
@@ -838,6 +1028,107 @@ class memoryManager:
             raise Exception("Unrecognized Kernel type")
         
         return True
+    
+    def loadActivationsFromDSPs(self, DSPWithActivation, DSPWithActivation2):
+        if (DSPWithActivation.isActive()):
+            raise Exception("Attempted to load activation to memory from an active DSP")
+        if (DSPWithActivation2.isActive()):
+            raise Exception("Attempted to load activation to memory from an active DSP")
+
+        # Now, I need to come up with a scheme on how activations should be loaded and fetched from memory
+        activation1 = DSPWithActivation.getOutput()
+        activation2 = DSPWithActivation2.getOutput()
+        
+        if (activation1.layer != activation2.layer):
+            raise Exception("Activations do not come from the same layer!")
+        
+        if (layerList[activation1.layer + 1] == "depthwise"):
+            pass
+        elif (layerList[activation1.layer + 1] == "pointwise"):
+            return self.loadActivationsToSRAM(activation1, activation2)
+        else:
+            raise Exception("Loading activation from DSP to non pointwise or depthwise layers not supported... for now")
+
+    def loadActivationFromDSP(self, DSPWithActivation):
+        if (DSPWithActivation.isActive()):
+            raise Exception("Attempted to load activation to memory from an active DSP")
+
+        activation = DSPWithActivation.getOutput()
+
+        if (layerList[activation.layer + 1] == "depthwise"):
+            pass
+        elif (layerList[activation.layer + 1] == "pointwise"):
+            return self.loadActivationToSRAM(activation)
+        else:
+            raise Exception("Loading activation from DSP to non pointwise or depthwise layers not supported... for now")
+
+    def getActivationSRAMLocation(self, activation):
+        layer = activation.layer
+        numChannels = channelsOut[layer]
+        maxX = spatialSize[layer]
+
+        if (activation.channel < 0 or activation.channel >= numChannels):
+            raise Exception("ERROR! Activation channel is outside the layer channel range")
+        if (activation.x < 0 or activation.x >= maxX):
+            raise Exception("ERROR! Activation x coordinate is outside the layer spatial range")
+        if (activation.y < 0 or activation.y >= maxX):
+            raise Exception("ERROR! Activation y coordinate is outside the layer spatial range")
+
+        index = activation.channel + (activation.x * numChannels) + (maxX * numChannels * activation.y)
+        trueIndex = index + SRAMStartIndex[layer]
+        packedIndex = trueIndex % SE_WEIGHTS_PER_SRAM_ADDRESS
+        SRAMJumps = trueIndex // SE_WEIGHTS_PER_SRAM_ADDRESS
+        SRAMNum = SRAMJumps % NUM_SRAMS
+        SRAMAddr = SRAMJumps // NUM_SRAMS
+
+        return (SRAMNum, SRAMAddr, packedIndex)
+    
+    def loadActivationsToSRAM(self, activation1, activation2):
+        if (activation1.layer != activation2.layer):
+            raise Exception("ERROR! Activations must be from the same layer to pack into one SRAM address")
+
+        activation1Location = self.getActivationSRAMLocation(activation1)
+        activation2Location = self.getActivationSRAMLocation(activation2)
+
+        if (activation1Location[0] != activation2Location[0] or activation1Location[1] != activation2Location[1]):
+            raise Exception("ERROR! Activations must pack into the same SRAM and address")
+        if (activation1Location[2] == activation2Location[2]):
+            raise Exception("ERROR! Activations cannot use the same packed SRAM position")
+
+        SRAMNum = activation1Location[0]
+        SRAMAddr = activation1Location[1]
+        SRAMobj = self.allSRAM[SRAMNum]
+
+        if (SRAMobj.isActiveWrite()):
+            return False
+
+        packedActivations = [None] * SE_WEIGHTS_PER_SRAM_ADDRESS
+        packedActivations[activation1Location[2]] = activation1
+        packedActivations[activation2Location[2]] = activation2
+        SRAMobj.writeSRAM(SRAMAddr, packedActivations)
+
+        return True
+
+    def loadActivationToSRAM(self, activation):
+        activationLocation = self.getActivationSRAMLocation(activation)
+
+        SRAMNum = activationLocation[0]
+        SRAMAddr = activationLocation[1]
+        packedIndex = activationLocation[2]
+        SRAMobj = self.allSRAM[SRAMNum]
+
+        if (SRAMobj.isActiveRead() or SRAMobj.isActiveWrite()):
+            return False
+
+        packedActivations = list(SRAMobj.readSRAM(SRAMAddr))
+        packedActivations[packedIndex] = activation
+        SRAMobj.writeSRAM(SRAMAddr, packedActivations)
+
+        return True
+            
+            
+            
+            
 
 # Before all else, load the LRAMs with their corresponding weights using the encoding scheme I invented:
 # Remember, 5 LRAM's are going to store all weights in the order that they are accessed, so the weights
@@ -901,47 +1192,74 @@ for layer in range(layers - NUM_MISC_LAYERS):
     part = 0
     
     if (layerList[layer] == "depthwise"):
-        kernelSize = DEPTHWISE_KERNEL_PARTS
+        layerKernelParts = DEPTHWISE_KERNEL_PARTS
         chunkSize = DEPTHWISE_KERNEL_PARTS
     elif (layerList[layer] == "pointwise"):
-        kernelSize = channelsOut[layer]
+        layerKernelParts = channelsIn[layer]
         chunkSize = POINTWISE_KERNEL_PARTS
     else:
         raise Exception("ERROR! Unsupported convolution weight type")
 
     if (((NUM_DSPS//channelsOut[layer]) > (spatialSize[layer] // 4)) and layerList[layer] == "pointwise"):
-        offset = 0
-        totalParts = 0
+        outputOffset = 0
+        inputOffset = 0
+        part = 0
         storeSecondHalf = False
-        while offset*chunkSize < (kernelSize//2):
+        while outputOffset < (channelsOut[layer]//2):
             for cycle in range(MAX_SIMULTANEOUS_LRAM_WRITES * WEIGHTS_PER_LRAM_ADDRESS):
                 if (not storeSecondHalf):
-                    totalParts = part+offset*chunkSize
+                    outputChannel = outputOffset
                 else:
-                    totalParts = part+offset*chunkSize+(kernelSize//2)
-                
-                weight = PointwiseWeight(layer=layer, channel=channel,
-                    y=totalParts)
+                    outputChannel = outputOffset + (channelsOut[layer]//2)
+
+                inputChannel = part + inputOffset*chunkSize
+                weight = PointwiseWeight(layer=layer, channel=inputChannel, y=outputChannel)
                 memory.loadWeightsInStart(weight)
-                
+
                 part += 1
                 if (part >= chunkSize):
-                    channel += 1
+                    inputOffset += 1
                     part = 0
-                
-                if (channel >= channelsIn[layer]):
-                    channel = 0
+
+                if (inputOffset*chunkSize >= layerKernelParts):
+                    inputOffset = 0
+                    part = 0
                     if (storeSecondHalf):
-                        offset += 1
+                        outputOffset += 1
                     storeSecondHalf = not storeSecondHalf
-                
-                if (offset*chunkSize >= (kernelSize//2)):
+
+                if (outputOffset >= (channelsOut[layer]//2)):
                     break
+
+            clkCycles += 1
+    elif (layerList[layer] == "pointwise"):
+        outputChannel = 0
+        offset = 0
+        totalParts = 0
+        while outputChannel < channelsOut[layer]:
+            for cycle in range(MAX_SIMULTANEOUS_LRAM_WRITES * WEIGHTS_PER_LRAM_ADDRESS):
+                totalParts = part + offset*chunkSize
+                weight = PointwiseWeight(layer=layer, channel=totalParts, y=outputChannel)
+                memory.loadWeightsInStart(weight)
+
+                part += 1
+                if (part >= chunkSize):
+                    offset += 1
+                    part = 0
+
+                if (offset*chunkSize >= layerKernelParts):
+                    outputChannel += 1
+                    offset = 0
+                    part = 0
+
+                if (outputChannel >= channelsOut[layer]):
+                    break
+
             clkCycles += 1
     else:
         offset = 0
         totalParts = 0
-        while offset*chunkSize < kernelSize:
+        while offset*chunkSize < layerKernelParts:
             for cycle in range(MAX_SIMULTANEOUS_LRAM_WRITES * WEIGHTS_PER_LRAM_ADDRESS):
                 if (layerList[layer] == "depthwise"):
                     weight = DepthwiseWeight(layer, channel, part)
@@ -965,7 +1283,7 @@ for layer in range(layers - NUM_MISC_LAYERS):
                 
                 totalParts = part+offset*chunkSize
                 
-                if (offset*chunkSize >= kernelSize):
+                if (offset*chunkSize >= layerKernelParts):
                     break
                 
             clkCycles += 1
@@ -996,20 +1314,68 @@ for misc_layer in range(MISC_LAYER_START, layers):
 
 memory.flushWeightsInStart()
 
+# Add here -- for each layer with Squeeze-Excite, store the squeeze excite neural net
+# The neural network is composed of two matrices. One of size
+# (Output Channel x SE Hidden Layer size)
+# one of size
+# (SE Hidden Layer size x Output Channel)
+# Store both matrices one after another, row after row.
+for layer in range(layers - NUM_MISC_LAYERS):
+    if (squeezeExcite[layer] != 1):
+        continue
+
+    memory.markSELayerStart(layer)
+
+    matrix = "squeeze"
+    row = 0
+    column = 0
+    while (matrix != "done"):
+        for cycle in range(MAX_SIMULTANEOUS_SRAM_WRITES * SE_WEIGHTS_PER_SRAM_ADDRESS):
+            weight = SEWeight(matrix=matrix, layer=layer, row=row, column=column)
+            memory.loadSEWeightsInStart(weight)
+
+            column += 1
+            if (matrix == "squeeze"):
+                if (column >= SEhiddenLayer[layer]):
+                    column = 0
+                    row += 1
+
+                if (row >= channelsOut[layer]):
+                    matrix = "excite"
+                    row = 0
+                    column = 0
+            elif (matrix == "excite"):
+                if (column >= channelsOut[layer]):
+                    column = 0
+                    row += 1
+
+                if (row >= SEhiddenLayer[layer]):
+                    matrix = "done"
+
+            if (matrix == "done"):
+                break
+
+        clkCycles += 1
+
+memory.flushSEWeightsInStart()
+
 imxCamera = camera(INITIAL_IMAGE_SIZE, INITIAL_IMAGE_SIZE)
 
 # Below is the behavior of the global controller:
-
-# Before we start the image, we want to preload the 
 
 imxCamera.startImage()
 
 pixelsComputed = 0
 
+print("Hello!\n")
+
 while (pixelsComputed < INITIAL_IMAGE_SIZE ** 2):
     imxCamera.updateCamera()
     
     pixelNumber = imxCamera.pixelNumber()
+    if (pixelNumber < 0):
+        continue
+
     pixelCoords = imxCamera.pixelCounterToXY(pixelNumber)
     pixelX = pixelCoords[0]
     pixelY = pixelCoords[1]
@@ -1024,16 +1390,12 @@ while (pixelsComputed < INITIAL_IMAGE_SIZE ** 2):
         continue
     
     if (targetY + 1 == pixelY):
-        if (targetX + 1 <= pixelX):
-            pass
-            
+        if (targetX + 1 > pixelX):
+            continue
     
-
-# Until we have two rows of data, we can't do anything
-for idx in range((128 + 2) * 30):
-    imxCamera.updateCamera()
-
-# Now we should have pixelNumber() == 128 + 2 = 130
-
-print("Should be 130 (pixelNumber) : " + str(imxCamera.pixelNumber()))
+    print(f"targetX: {targetX}, targetY: {targetY}\n")
+    if (DSPMngr.startDepthwiseConvFromCamera(targetX, targetY, imxCamera)):
+        pixelsComputed += 1
+    
+    DSPMngr.update()
 
