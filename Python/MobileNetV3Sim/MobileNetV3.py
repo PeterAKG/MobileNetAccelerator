@@ -6,7 +6,9 @@
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
-from dataclasses import dataclass, field, replace
+import json
+from dataclasses import dataclass, field, replace, asdict, is_dataclass
+from pathlib import Path
 from typing import Literal, Optional, Union
 from collections import deque
 from typing import List
@@ -21,7 +23,8 @@ kernelSize = np.zeros(layers, dtype=int)
 stride = np.zeros(layers, dtype=int)
 channelsIn = np.zeros(layers, dtype=int)
 channelsOut = np.zeros(layers, dtype=int)
-spatialSize = np.zeros(layers, dtype=int)
+spatialOutput = np.zeros(layers, dtype=int)
+spatialInput = np.zeros(layers, dtype=int)
 squeezeExcite = np.zeros(layers, dtype=int)
 SEhiddenLayer = np.zeros(layers, dtype=int)
 SRAMStartIndex = np.zeros(layers, dtype=int)
@@ -41,7 +44,8 @@ for idx, row in df.iterrows():
         stride[idx] = int(row["Stride"])
         channelsIn[idx] = int(row["In"])
         channelsOut[idx] = int(row["Out"])
-        spatialSize[idx] = int(row["Spatial"])
+        spatialOutput[idx] = int(row["Spatial Output"])
+        spatialInput[idx] = int(row["Spatial Input"])
         if(row["SE"] == "Yes"):
             squeezeExcite[idx] = 1
             SEhiddenLayer[idx] = int(row["SE Hidden Layer"])
@@ -52,6 +56,23 @@ for idx, row in df.iterrows():
 
 DEPTHWISE_KERNEL_PARTS = 9
 POINTWISE_KERNEL_PARTS = 9
+
+def makeJSONSerializable(value):
+    if (value is None):
+        return None
+    if (is_dataclass(value)):
+        return makeJSONSerializable(asdict(value))
+    if (isinstance(value, dict)):
+        return {key: makeJSONSerializable(val) for key, val in value.items()}
+    if (isinstance(value, (list, tuple))):
+        return [makeJSONSerializable(item) for item in value]
+    if (isinstance(value, np.integer)):
+        return int(value)
+    if (isinstance(value, np.floating)):
+        return float(value)
+    if (isinstance(value, np.ndarray)):
+        return makeJSONSerializable(value.tolist())
+    return value
 
 @dataclass
 class DepthwiseWeight:
@@ -220,6 +241,17 @@ class SRAM:
             raise Exception("ERROR! SRAM attempted to write more than once in the same clock cycle")
         self.lastWriteClockCycle = clkCycles
         self.memory[address] = data
+
+    def exportAsJSON(self):
+        addresses = []
+        for address in range(self.addresses):
+            addresses.append({
+                "address": address,
+                "data": makeJSONSerializable(list(self.memory[address]))
+            })
+        return {
+            "addresses": addresses
+        }
         
 class LRAM:
     
@@ -267,6 +299,20 @@ class LRAM:
         self.lastWriteClockCycle = clkCycles
         self.memory[address] = data
 
+    def exportAsJSON(self):
+        addresses = []
+        for address in range(self.addresses):
+            addresses.append({
+                "address": address,
+                "data": makeJSONSerializable(list(self.memory[address]))
+            })
+        return {
+            "addresses": addresses
+        }
+
+# I don't think I am going to use this and I'm not sure why I ever planned to
+# Or maybe I will. I honestly don't know
+# Honestly -- probably not. It doesn't seem like it would save many cycles, and it increases complexity
 class flexBuffer:
 
     def __init__(self):
@@ -316,6 +362,91 @@ class flexBuffer:
             
             self.numColumnsRead += 1
             return toReturn
+
+PIXEL_HISTORY_MAP_DEPTH = 3
+PIXEL_HISTORY_MAP_SIZE = 64
+# This tracks the OUTPUT of each respective layer. Not the INPUT.
+class pixelHistorian:
+    
+    def __init__(self, width, height, depth):
+        self.width = width
+        self.height = height
+        self.depth = depth
+        self.pixelHistoryMap = np.zeros((width, height, depth), dtype=bool)
+        self.layerForSlot = np.arange(depth, dtype=int)
+        self.lastCompletedLayer = -1
+        self.layerPointer = 0
+
+    def getLayerSlot(self, layer):
+        if (layer < 0):
+            raise Exception("ERROR! Pixel layer cannot be negative")
+
+        matches = np.where(self.layerForSlot == layer)[0]
+        if (len(matches) == 0):
+            minTrackedLayer = int(np.min(self.layerForSlot))
+            maxTrackedLayer = int(np.max(self.layerForSlot))
+            raise Exception(f"ERROR! Pixel layer {layer} is outside the tracked layer window ({minTrackedLayer}-{maxTrackedLayer})")
+
+        return int(matches[0])
+    
+    def setPixelFinished(self, x, y, layer):
+        if (x < 0 or x >= self.width):
+            raise Exception("ERROR! Pixel x coordinate is outside the pixel history map width")
+        if (y < 0 or y >= self.height):
+            raise Exception("ERROR! Pixel y coordinate is outside the pixel history map height")
+
+        layerSlot = self.getLayerSlot(layer)
+        layerSpatialSize = spatialOutput[layer]
+        if (x >= layerSpatialSize or y >= layerSpatialSize):
+            raise Exception(f"ERROR! Pixel ({x}, {y}) is outside layer {layer}'s spatial output ({layerSpatialSize}x{layerSpatialSize})")
+
+        self.pixelHistoryMap[x, y, layerSlot] = True
+
+        completedLayer = int(self.layerForSlot[self.layerPointer])
+        completedSpatialSize = spatialOutput[completedLayer]
+        while (self.pixelHistoryMap[:completedSpatialSize, :completedSpatialSize, self.layerPointer].all()):
+            if (completedLayer != self.lastCompletedLayer + 1):
+                break
+
+            self.lastCompletedLayer = completedLayer
+            nextLayer = self.lastCompletedLayer + self.depth
+            self.pixelHistoryMap[:, :, self.layerPointer] = False
+            self.layerForSlot[self.layerPointer] = nextLayer
+            self.layerPointer = (self.layerPointer + 1) % self.depth
+            completedLayer = int(self.layerForSlot[self.layerPointer])
+            completedSpatialSize = spatialOutput[completedLayer]
+
+    def isQuarterFinished(self, layer, quarter):
+        layerSlot = self.getLayerSlot(layer)
+        layerSpatialSize = spatialOutput[layer]
+        halfSpatialSize = layerSpatialSize // 2
+
+        if (quarter == 1):
+            xStart = 0
+            xEnd = halfSpatialSize + 1
+            yStart = 0
+            yEnd = halfSpatialSize + 1
+        elif (quarter == 2):
+            xStart = halfSpatialSize - 1
+            xEnd = layerSpatialSize
+            yStart = 0
+            yEnd = halfSpatialSize + 1
+        elif (quarter == 3):
+            xStart = 0
+            xEnd = halfSpatialSize + 1
+            yStart = halfSpatialSize - 1
+            yEnd = layerSpatialSize
+        elif (quarter == 4):
+            xStart = halfSpatialSize - 1
+            xEnd = layerSpatialSize
+            yStart = halfSpatialSize - 1
+            yEnd = layerSpatialSize
+        else:
+            raise Exception("ERROR! Quarter must be 1, 2, 3, or 4")
+
+        return bool(self.pixelHistoryMap[xStart:xEnd, yStart:yEnd, layerSlot].all())
+
+pixelMap = pixelHistorian(PIXEL_HISTORY_MAP_SIZE, PIXEL_HISTORY_MAP_SIZE, PIXEL_HISTORY_MAP_DEPTH)
 
 # I am just going to assume 680 FPS right now with the data coming in consistently at that rate, and adjust once I actually make dev board and solder everything
 # and understand the true frame rate
@@ -409,26 +540,12 @@ class DSPunit:
     
     def loadKernel(self):
         self.kernel = replace(self.preloadedKernel)
-        if (isinstance(self.kernel, PointwiseKernel)):
-            print(f"""kernel:
-                channel: {self.kernel.channelGroup}
-                layer: {self.kernel.layer}
-                type: {self.kernel.type}""")
-        else:
-            print(f"""kernel:
-                channel: {self.kernel.channel}
-                layer: {self.kernel.layer}
-                type: {self.kernel.type}""")
     
     def preloadActivation(self, activationChunk: ActivationChunk):
         self.preloadedActivationChunk = activationChunk
         
     def loadActivation(self):
         self.activationChunk = replace(self.preloadedActivationChunk)
-        print(f"""activationChunk:
-              channel: {self.activationChunk.channel}
-              layer: {self.activationChunk.layer}
-              type: {self.activationChunk.type}""")
         
     def startDotProduct(self):
         if (isinstance(self.kernel, PointwiseKernel)):
@@ -476,12 +593,13 @@ class DSPunit:
         if (self.isActive()):
             raise Exception("ERROR! Activation was attempted to be taken from active DSP slice")
         else:
+            outputStride = stride[self.activationChunk.layer]
             if (self.kernel.type == "depthwise"):
                 toReturn = Activation(
                     type="depthwise",
                     layer=self.kernel.layer,
-                    x=self.activationChunk.x,
-                    y=self.activationChunk.y,
+                    x=self.activationChunk.x // outputStride,
+                    y=self.activationChunk.y // outputStride,
                     channel=self.kernel.channel)
             else:
                 accumulatedChannelSet = set(self.accumulatedChannels)
@@ -491,14 +609,14 @@ class DSPunit:
                     toReturn = Activation(
                         type="pointwise",
                         layer=self.kernel.layer,
-                        x=self.accumulatedX,
-                        y=self.accumulatedY,
+                        x=self.accumulatedX // outputStride,
+                        y=self.accumulatedY // outputStride,
                         channel=self.kernel.channel)
                 else:
                     toReturn = PartialActivation(
                         layers=[self.kernel.layer],
-                        x=self.accumulatedX,
-                        y=self.accumulatedY,
+                        x=self.accumulatedX // outputStride,
+                        y=self.accumulatedY // outputStride,
                         segment=self.activationChunk.channelChunk,
                         outputChannel=self.kernel.channel)
 
@@ -568,8 +686,8 @@ class DSPmanager:
         return len(self.operationFIFO)
     
     def startDepthwiseConvFromCamera(self, targetX, targetY, camera: camera):
-        lastNeededX = min(targetX + 1, camera.width - 1)
-        lastNeededY = min(targetY + 1, camera.height - 1)
+        lastNeededX = min(targetX + (kernelSize[0] // 2), camera.width - 1)
+        lastNeededY = min(targetY + (kernelSize[0] // 2), camera.height - 1)
         lastNeededPixel = camera.xyToPixelCounter(lastNeededX, lastNeededY)
 
         if (camera.pixelNumber() < lastNeededPixel):
@@ -603,11 +721,12 @@ class DSPmanager:
         # Depthwise convolutions go left to right, top to bottom
         INITIAL_CONVOLUTION_K = 3
         if isinstance(operation, CameraDepthwiseConvOperation):
+            kernelRadius = INITIAL_CONVOLUTION_K // 2
             cameraActivationList = []
             for height in range(INITIAL_CONVOLUTION_K):
                 for width in range(INITIAL_CONVOLUTION_K):
-                    activationX = operation.targetX + (width - 1)
-                    activationY = operation.targetY + (height - 1)
+                    activationX = operation.targetX + (width - kernelRadius)
+                    activationY = operation.targetY + (height - kernelRadius)
                     if (activationX < 0 or activationX >= imxCamera.width):
                         continue
                     if (activationY < 0 or activationY >= imxCamera.height):
@@ -632,6 +751,7 @@ class DSPmanager:
             if (operation.nextToRead == channelsOut[0]):
                 for DSPunit in DSPunits:
                     DSPunit.setOperationTag(None)
+                pixelMap.setPixelFinished(operation.targetX, operation.targetY, 0)
                 self.fifoPop()
                 return
             
@@ -897,7 +1017,7 @@ class memoryManager:
         if (firstActivation.type == "depthwise"):
             layerKernelSize = kernelSize[firstActivation.layer]
             kernelRadius = layerKernelSize // 2
-            layerSpatialSize = spatialSize[firstActivation.layer]
+            layerSpatialSize = spatialInput[firstActivation.layer]
 
             if (layerKernelSize != 3 and layerKernelSize != 5):
                 raise Exception("ERROR! Unsupported depthwise activation kernel size")
@@ -906,7 +1026,7 @@ class memoryManager:
                 if (activation.layer != firstActivation.layer or activation.channel != firstActivation.channel):
                     raise Exception("ERROR! Depthwise activations are not in the same chunk")
                 if (activation.x < 0 or activation.x >= layerSpatialSize):
-                    raise Exception("ERROR! Depthwise activation x coordinate is outside the layer bounds")
+                    raise Exception(f"ERROR! Depthwise activation x coordinate is outside the layer bounds.\n X val = {activation.x}")
                 if (activation.y < 0 or activation.y >= layerSpatialSize):
                     raise Exception("ERROR! Depthwise activation y coordinate is outside the layer bounds")
 
@@ -1065,12 +1185,12 @@ class memoryManager:
     def getActivationSRAMLocation(self, activation):
         layer = activation.layer
         numChannels = channelsOut[layer]
-        maxX = spatialSize[layer]
+        maxX = spatialOutput[layer]
 
         if (activation.channel < 0 or activation.channel >= numChannels):
             raise Exception("ERROR! Activation channel is outside the layer channel range")
         if (activation.x < 0 or activation.x >= maxX):
-            raise Exception("ERROR! Activation x coordinate is outside the layer spatial range")
+            raise Exception(f"ERROR! Activation x coordinate is outside the layer spatial range (X = {activation.x}, maxX = {maxX})")
         if (activation.y < 0 or activation.y >= maxX):
             raise Exception("ERROR! Activation y coordinate is outside the layer spatial range")
 
@@ -1126,9 +1246,59 @@ class memoryManager:
 
         return True
             
-            
-            
-            
+def exportToJSON(memoryManagerObj, message="", rootDirectory="snapshots"):
+    rootPath = Path(rootDirectory)
+    clockCycleDirectory = rootPath / str(clkCycles)
+
+    SRAMDirectory = clockCycleDirectory / "SRAM"
+    SRAMDirectory.mkdir(parents=True, exist_ok=True)
+    for SRAMIndex, SRAMobj in enumerate(memoryManagerObj.allSRAM):
+        filePath = SRAMDirectory / f"SRAM{SRAMIndex}.json"
+        with filePath.open("w", encoding="utf-8") as jsonFile:
+            json.dump(SRAMobj.exportAsJSON(), jsonFile, indent=2)
+
+    LRAMDirectory = clockCycleDirectory / "LRAM"
+    LRAMDirectory.mkdir(parents=True, exist_ok=True)
+    for LRAMIndex, LRAMobj in enumerate(memoryManagerObj.allLRAM):
+        filePath = LRAMDirectory / f"LRAM{LRAMIndex}.json"
+        with filePath.open("w", encoding="utf-8") as jsonFile:
+            json.dump(LRAMobj.exportAsJSON(), jsonFile, indent=2)
+
+    with (clockCycleDirectory / "message.json").open("w", encoding="utf-8") as jsonFile:
+        json.dump({"message": message}, jsonFile, indent=2)
+
+    rootPath.mkdir(parents=True, exist_ok=True)
+    startOfLayerData = []
+    for layer in range(len(memoryManagerObj.startOfLayer)):
+        startOfLayerData.append({
+            "layer": layer,
+            "LRAMNum": int(memoryManagerObj.startOfLayer[layer][0]),
+            "LRAMAddr": int(memoryManagerObj.startOfLayer[layer][1]),
+            "packedPosition": int(memoryManagerObj.startOfLayer[layer][2])
+        })
+
+    with (rootPath / "LRAMStartOfLayer.json").open("w", encoding="utf-8") as jsonFile:
+        json.dump(startOfLayerData, jsonFile, indent=2)
+
+    SRAMStartData = []
+    for layer in range(len(SRAMStartIndex)):
+        trueIndex = int(SRAMStartIndex[layer])
+        packedIndex = trueIndex % SE_WEIGHTS_PER_SRAM_ADDRESS
+        SRAMJumps = trueIndex // SE_WEIGHTS_PER_SRAM_ADDRESS
+        SRAMNum = SRAMJumps % NUM_SRAMS
+        SRAMAddr = SRAMJumps // NUM_SRAMS
+        SRAMStartData.append({
+            "layer": layer,
+            "SRAMStartIndex": trueIndex,
+            "SRAMNum": int(SRAMNum),
+            "SRAMAddr": int(SRAMAddr),
+            "packedIndex": int(packedIndex)
+        })
+
+    with (rootPath / "SRAMStartOfLayer.json").open("w", encoding="utf-8") as jsonFile:
+        json.dump(SRAMStartData, jsonFile, indent=2)
+
+    return clockCycleDirectory
 
 # Before all else, load the LRAMs with their corresponding weights using the encoding scheme I invented:
 # Remember, 5 LRAM's are going to store all weights in the order that they are accessed, so the weights
@@ -1200,7 +1370,7 @@ for layer in range(layers - NUM_MISC_LAYERS):
     else:
         raise Exception("ERROR! Unsupported convolution weight type")
 
-    if (((NUM_DSPS//channelsOut[layer]) > (spatialSize[layer] // 4)) and layerList[layer] == "pointwise"):
+    if (((NUM_DSPS//channelsOut[layer]) > (spatialOutput[layer] // 4)) and layerList[layer] == "pointwise"):
         outputOffset = 0
         inputOffset = 0
         part = 0
@@ -1275,7 +1445,7 @@ for layer in range(layers - NUM_MISC_LAYERS):
                     channel += 1
                     part = 0
                 
-                if (channel >= channelsIn[layer]):
+                if (channel >= channelsOut[layer]):
                     offset += 1
                     channel = 0
                     if (layerList[layer] == "depthwise"):
@@ -1367,35 +1537,55 @@ imxCamera.startImage()
 
 pixelsComputed = 0
 
-print("Hello!\n")
+inferenceCompleted = False
 
-while (pixelsComputed < INITIAL_IMAGE_SIZE ** 2):
-    imxCamera.updateCamera()
-    
-    pixelNumber = imxCamera.pixelNumber()
-    if (pixelNumber < 0):
-        continue
+imageJustIn = True
 
-    pixelCoords = imxCamera.pixelCounterToXY(pixelNumber)
-    pixelX = pixelCoords[0]
-    pixelY = pixelCoords[1]
-    
-    # This is the next output we want to calculate
-    targetOutput = imxCamera.pixelCounterToXY(pixelsComputed)
-    
-    targetX = targetOutput[0]
-    targetY = targetOutput[1]
-    
-    if (targetY >= pixelY):
-        continue
-    
-    if (targetY + 1 == pixelY):
-        if (targetX + 1 > pixelX):
+while (inferenceCompleted == False):
+
+    if (pixelsComputed < spatialOutput[0] ** 2):
+        imxCamera.updateCamera()
+        
+        pixelNumber = imxCamera.pixelNumber()
+        if (pixelNumber < 0):
             continue
+
+        # This is the next input pixel the stride lands on.
+        targetOutputX = pixelsComputed % spatialOutput[0]
+        targetOutputY = pixelsComputed // spatialOutput[0]
+
+        targetX = targetOutputX * stride[0]
+        targetY = targetOutputY * stride[0]
+
+        kernelRadius = kernelSize[0] // 2
+        lastNeededX = min(targetX + kernelRadius, imxCamera.width - 1)
+        lastNeededY = min(targetY + kernelRadius, imxCamera.height - 1)
+        lastNeededPixel = imxCamera.xyToPixelCounter(lastNeededX, lastNeededY)
+
+        if (pixelNumber < lastNeededPixel):
+            continue
+        
+        print(f"targetX: {targetX}, targetY: {targetY}\n")
+        if (DSPMngr.startDepthwiseConvFromCamera(targetX, targetY, imxCamera)):
+            pixelsComputed += 1
+        else:
+            pass
+    else:
+        if (imageJustIn):
+            exportToJSON(memory, "image just recieved")
+            imageJustIn = False
     
-    print(f"targetX: {targetX}, targetY: {targetY}\n")
-    if (DSPMngr.startDepthwiseConvFromCamera(targetX, targetY, imxCamera)):
-        pixelsComputed += 1
+    # I think what I need is an array showing which pixels are done computing on all channels. And it should go back three
+    # layers. Once the oldest layer is done, it moves forward a layer. Then what we have is a way to track which layers
+    # are complete, as well as which pixels are complete, so we know how to move forward.
+    
+    # Ok I did this -- a PixelHistorian class which stores the 3 next layers to be completed. Now I just need to think of
+    # some logic to interact with this class to determine
     
     DSPMngr.update()
+    clkCycles += 1
+    
+    if (DSPMngr.fifoCheckLen() == 0):
+        break
 
+exportToJSON(memory, "done with inference")
