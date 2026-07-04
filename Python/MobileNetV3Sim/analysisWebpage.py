@@ -202,6 +202,70 @@ HTML = r"""<!doctype html>
       margin-bottom: 10px;
     }
 
+    .dspPanel {
+      display: none;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      margin-bottom: 12px;
+    }
+
+    .dspPanel.visible {
+      display: block;
+    }
+
+    .dspHeader {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--line);
+      background: #eef2f5;
+    }
+
+    .dspStats {
+      display: flex;
+      gap: 14px;
+      flex-wrap: wrap;
+      color: var(--muted);
+    }
+
+    .dspStats strong {
+      color: var(--text);
+      font-weight: 650;
+    }
+
+    .dspControls {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .chartBlock {
+      padding: 10px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .chartBlock:last-child {
+      border-bottom: 0;
+    }
+
+    .chartTitle {
+      margin-bottom: 6px;
+      color: var(--muted);
+      font-weight: 650;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      border: 1px solid var(--line);
+      background: #fff;
+    }
+
     .tableWrap {
       max-height: calc(100vh - 134px);
       overflow: auto;
@@ -315,6 +379,27 @@ HTML = r"""<!doctype html>
     </aside>
     <div class="viewer">
       <div id="status" class="status">Loading snapshots...</div>
+      <section id="dspPanel" class="dspPanel">
+        <div class="dspHeader">
+          <div>DSP Activity</div>
+          <div id="dspStats" class="dspStats"></div>
+        </div>
+        <div class="dspControls">
+          <label>Cycle Start <input id="dspStart" type="number" min="0" value="0"></label>
+          <label>Cycles <input id="dspWindow" type="number" min="1" value="500"></label>
+          <label>DSP Start <input id="dspRangeStart" type="number" min="0" value="0"></label>
+          <label>DSP Count <input id="dspRangeCount" type="number" min="1" value="292"></label>
+          <button id="dspFullRangeBtn" type="button">Full Range</button>
+        </div>
+        <div class="chartBlock">
+          <div class="chartTitle">Active DSPs Per Clock Cycle</div>
+          <canvas id="dspCountCanvas" height="180"></canvas>
+        </div>
+        <div class="chartBlock">
+          <div class="chartTitle">DSP Waterfall</div>
+          <canvas id="dspWaterfallCanvas" height="340"></canvas>
+        </div>
+      </section>
       <div class="tableWrap">
         <table id="grid"></table>
       </div>
@@ -328,12 +413,22 @@ HTML = r"""<!doctype html>
       memoryType: "SRAM",
       memory: null,
       startOfLayer: [],
-      message: ""
+      message: "",
+      dspActivity: null
     };
 
     const cyclesEl = document.getElementById("cycles");
     const snapshotMessageEl = document.getElementById("snapshotMessage");
     const gridEl = document.getElementById("grid");
+    const dspPanelEl = document.getElementById("dspPanel");
+    const dspStatsEl = document.getElementById("dspStats");
+    const dspStartEl = document.getElementById("dspStart");
+    const dspWindowEl = document.getElementById("dspWindow");
+    const dspRangeStartEl = document.getElementById("dspRangeStart");
+    const dspRangeCountEl = document.getElementById("dspRangeCount");
+    const dspFullRangeBtn = document.getElementById("dspFullRangeBtn");
+    const dspCountCanvas = document.getElementById("dspCountCanvas");
+    const dspWaterfallCanvas = document.getElementById("dspWaterfallCanvas");
     const startTitleEl = document.getElementById("startTitle");
     const startOfLayerEl = document.getElementById("startOfLayer");
     const statusEl = document.getElementById("status");
@@ -370,6 +465,10 @@ HTML = r"""<!doctype html>
         button.className = cycle === state.cycle ? "active" : "";
         button.addEventListener("click", () => {
           state.cycle = cycle;
+          dspStartEl.value = "";
+          dspWindowEl.value = "";
+          dspRangeStartEl.value = "";
+          dspRangeCountEl.value = "";
           renderCycleButtons();
           loadMemory();
         });
@@ -519,6 +618,206 @@ HTML = r"""<!doctype html>
       startOfLayerEl.innerHTML = header + rows;
     }
 
+    function resizeCanvas(canvas) {
+      const width = Math.max(320, Math.floor(canvas.clientWidth));
+      const height = Number(canvas.getAttribute("height"));
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;
+        canvas.height = height;
+      }
+    }
+
+    function dspClockAtIndex(index) {
+      return state.dspActivity.firstClock + index;
+    }
+
+    function getDSPVisibleRange() {
+      const dsp = state.dspActivity;
+      if (!dsp || dsp.numCycles === 0) {
+        return null;
+      }
+
+      const requestedStartClock = Number(dspStartEl.value || dsp.firstClock);
+      const requestedCycles = Math.floor(Math.max(1, Number(dspWindowEl.value || dsp.numCycles)));
+      const startIndex = Math.floor(Math.min(Math.max(0, requestedStartClock - dsp.firstClock), dsp.numCycles - 1));
+      const endIndex = Math.min(dsp.numCycles, startIndex + requestedCycles);
+      return { startIndex, endIndex };
+    }
+
+    function calculateVisibleDSPStats(timeRange) {
+      const dsp = state.dspActivity;
+      const visibleCycles = Math.max(0, timeRange.endIndex - timeRange.startIndex);
+      const visibleDSPs = dsp.numDSPsShown;
+      const visibleCounts = dsp.activeCounts.slice(timeRange.startIndex, timeRange.endIndex);
+      const activeSlots = visibleCounts.reduce((total, count) => total + count, 0);
+      const maxActive = visibleCounts.length ? Math.max(...visibleCounts) : 0;
+
+      const totalSlots = visibleCycles * visibleDSPs;
+      return {
+        visibleCycles,
+        visibleDSPs,
+        utilizationPercent: totalSlots ? (activeSlots / totalSlots) * 100 : 0,
+        maxActive
+      };
+    }
+
+    function renderDSPActivity() {
+      const dsp = state.dspActivity;
+      if (!dsp || !dsp.hasData) {
+        dspPanelEl.classList.remove("visible");
+        return;
+      }
+
+      if (!dspStartEl.value) {
+        dspStartEl.value = dsp.firstClock;
+      }
+      if (!dspWindowEl.value) {
+        dspWindowEl.value = Math.min(500, dsp.numCycles);
+      }
+      if (!dspRangeStartEl.value) {
+        dspRangeStartEl.value = 0;
+      }
+      if (!dspRangeCountEl.value) {
+        dspRangeCountEl.value = dsp.numDSPs;
+      }
+
+      const timeRange = getDSPVisibleRange();
+      const visibleStats = calculateVisibleDSPStats(timeRange);
+
+      dspPanelEl.classList.add("visible");
+      dspStatsEl.innerHTML = [
+        `<span><strong>${visibleStats.utilizationPercent.toFixed(2)}%</strong> active time in view</span>`,
+        `<span><strong>${dsp.utilizationPercent.toFixed(2)}%</strong> active time full snapshot</span>`,
+        `<span><strong>${visibleStats.visibleCycles}</strong> cycles shown</span>`,
+        `<span><strong>${visibleStats.visibleDSPs}</strong> DSPs shown</span>`,
+        `<span><strong>${visibleStats.maxActive}</strong> peak active in view</span>`
+      ].join("");
+
+      drawDSPCountGraph();
+      drawDSPWaterfall();
+    }
+
+    async function loadDSPActivity() {
+      if (!state.cycle) {
+        return;
+      }
+
+      const dspStart = Math.max(0, Math.floor(Number(dspRangeStartEl.value || 0)));
+      const dspCount = Math.max(1, Math.floor(Number(dspRangeCountEl.value || 292)));
+      try {
+        state.dspActivity = await fetchJSON(`/api/dsp-activations?cycle=${encodeURIComponent(state.cycle)}&dsp_start=${dspStart}&dsp_count=${dspCount}`);
+        renderDSPActivity();
+      } catch (error) {
+        state.dspActivity = null;
+        renderDSPActivity();
+        setStatus(`Failed to load DSP activity: ${error.message}`, true);
+      }
+    }
+
+    function drawDSPCountGraph() {
+      const dsp = state.dspActivity;
+      const range = getDSPVisibleRange();
+      if (!dsp || !range) {
+        return;
+      }
+
+      resizeCanvas(dspCountCanvas);
+      const ctx = dspCountCanvas.getContext("2d");
+      const width = dspCountCanvas.width;
+      const height = dspCountCanvas.height;
+      const padLeft = 44;
+      const padRight = 10;
+      const padTop = 12;
+      const padBottom = 26;
+      const plotWidth = width - padLeft - padRight;
+      const plotHeight = height - padTop - padBottom;
+
+      ctx.clearRect(0, 0, width, height);
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, width, height);
+      ctx.strokeStyle = "#d7dce2";
+      ctx.strokeRect(padLeft, padTop, plotWidth, plotHeight);
+
+      ctx.fillStyle = "#5f6b7a";
+      ctx.font = "12px Segoe UI, system-ui, sans-serif";
+      const visibleDSPs = dsp.numDSPsShown;
+      ctx.fillText(String(visibleDSPs), 8, padTop + 4);
+      ctx.fillText("0", 28, padTop + plotHeight);
+      ctx.fillText(String(dspClockAtIndex(range.startIndex)), padLeft, height - 7);
+      ctx.textAlign = "right";
+      ctx.fillText(String(dspClockAtIndex(range.endIndex - 1)), width - padRight, height - 7);
+      ctx.textAlign = "left";
+
+      const visibleCount = Math.max(1, range.endIndex - range.startIndex);
+      ctx.beginPath();
+      for (let index = range.startIndex; index < range.endIndex; index += 1) {
+        const x = padLeft + ((index - range.startIndex) / Math.max(1, visibleCount - 1)) * plotWidth;
+        const activeCount = dsp.activeCounts[index];
+        const y = padTop + plotHeight - (activeCount / Math.max(1, visibleDSPs)) * plotHeight;
+        if (index === range.startIndex) {
+          ctx.moveTo(x, y);
+        } else {
+          ctx.lineTo(x, y);
+        }
+      }
+      ctx.strokeStyle = "#0f766e";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+
+    function drawDSPWaterfall() {
+      const dsp = state.dspActivity;
+      const range = getDSPVisibleRange();
+      if (!dsp || !range) {
+        return;
+      }
+
+      resizeCanvas(dspWaterfallCanvas);
+      const ctx = dspWaterfallCanvas.getContext("2d");
+      const width = dspWaterfallCanvas.width;
+      const height = dspWaterfallCanvas.height;
+      const padLeft = 48;
+      const padRight = 10;
+      const padTop = 12;
+      const padBottom = 26;
+      const plotWidth = width - padLeft - padRight;
+      const plotHeight = height - padTop - padBottom;
+      const visibleCount = Math.max(1, range.endIndex - range.startIndex);
+
+      ctx.clearRect(0, 0, width, height);
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, width, height);
+      ctx.strokeStyle = "#d7dce2";
+      ctx.strokeRect(padLeft, padTop, plotWidth, plotHeight);
+
+      ctx.fillStyle = "#5f6b7a";
+      ctx.font = "12px Segoe UI, system-ui, sans-serif";
+      ctx.fillText(`DSP${dsp.dspStart}`, 8, padTop + 10);
+      ctx.fillText(`DSP${dsp.dspEnd - 1}`, 8, padTop + plotHeight);
+      ctx.fillText(String(dspClockAtIndex(range.startIndex)), padLeft, height - 7);
+      ctx.textAlign = "right";
+      ctx.fillText(String(dspClockAtIndex(range.endIndex - 1)), width - padRight, height - 7);
+      ctx.textAlign = "left";
+
+      ctx.fillStyle = "#d7352a";
+      const visibleDSPs = Math.max(1, dsp.numDSPsShown);
+      const rowHeight = plotHeight / visibleDSPs;
+      for (let dspIndex = 0; dspIndex < dsp.activeRuns.length; dspIndex += 1) {
+        const y = padTop + dspIndex * rowHeight;
+        const h = Math.max(1, Math.ceil(rowHeight));
+        for (const run of dsp.activeRuns[dspIndex]) {
+          const runStart = Math.max(run[0], range.startIndex);
+          const runEnd = Math.min(run[1], range.endIndex);
+          if (runStart >= runEnd) {
+            continue;
+          }
+          const x = padLeft + ((runStart - range.startIndex) / visibleCount) * plotWidth;
+          const w = Math.max(1, ((runEnd - runStart) / visibleCount) * plotWidth);
+          ctx.fillRect(x, y, w, h);
+        }
+      }
+    }
+
     function escapeHTML(value) {
       return String(value)
         .replaceAll("&", "&amp;")
@@ -537,13 +836,16 @@ HTML = r"""<!doctype html>
         const messageData = await fetchJSON(`/api/message?cycle=${encodeURIComponent(state.cycle)}`);
         state.message = messageData.message || "";
         renderSnapshotMessage();
+        await loadDSPActivity();
         state.startOfLayer = await fetchJSON(`/api/start-of-layer?type=${state.memoryType}`);
         renderStartOfLayer();
         state.memory = await fetchJSON(`/api/memory?cycle=${encodeURIComponent(state.cycle)}&type=${state.memoryType}`);
         renderGrid();
       } catch (error) {
         state.message = "";
+        state.dspActivity = null;
         renderSnapshotMessage();
+        renderDSPActivity();
         setStatus(`Failed to load memory: ${error.message}`, true);
       }
     }
@@ -581,6 +883,21 @@ HTML = r"""<!doctype html>
     rowCountEl.addEventListener("change", renderGrid);
     nonEmptyOnlyEl.addEventListener("change", renderGrid);
     reloadBtn.addEventListener("click", loadMemory);
+    dspStartEl.addEventListener("change", renderDSPActivity);
+    dspWindowEl.addEventListener("change", renderDSPActivity);
+    dspRangeStartEl.addEventListener("change", loadDSPActivity);
+    dspRangeCountEl.addEventListener("change", loadDSPActivity);
+    dspFullRangeBtn.addEventListener("click", () => {
+      if (!state.dspActivity || !state.dspActivity.hasData) {
+        return;
+      }
+      dspStartEl.value = state.dspActivity.firstClock;
+      dspWindowEl.value = state.dspActivity.numCycles;
+      dspRangeStartEl.value = 0;
+      dspRangeCountEl.value = state.dspActivity.numDSPs;
+      renderDSPActivity();
+    });
+    window.addEventListener("resize", renderDSPActivity);
 
     init();
   </script>
@@ -648,6 +965,150 @@ def read_snapshot_message(cycle):
     return {"message": str(data)}
 
 
+def read_dsp_activations(cycle, dsp_start=0, dsp_count=None):
+    file_path = SNAPSHOTS_DIR / cycle / "DSPActivations.json"
+    if not file_path.is_file():
+        return {
+            "hasData": False,
+            "message": "No DSP activation tracking found for this snapshot."
+        }
+
+    try:
+        with file_path.open("r", encoding="utf-8") as json_file:
+            data = json.load(json_file)
+    except json.JSONDecodeError:
+        return {
+            "hasData": False,
+            "message": "DSP activation tracking file is empty or incomplete."
+        }
+
+    num_dsps = int(data.get("numDSPs", 0))
+    if num_dsps <= 0:
+        return {
+            "hasData": False,
+            "message": "DSP activation tracking file is empty."
+        }
+
+    dsp_start = max(0, min(int(dsp_start), num_dsps - 1))
+    if dsp_count is None:
+        dsp_count = num_dsps
+    dsp_count = max(1, int(dsp_count))
+    dsp_end = min(num_dsps, dsp_start + dsp_count)
+    selected_dsps = dsp_end - dsp_start
+
+    if data.get("format") == "active-runs-v1":
+        num_cycles = int(data.get("numCycles", 0))
+        if num_cycles <= 0:
+            return {
+                "hasData": False,
+                "message": "DSP activation tracking file is empty."
+            }
+
+        first_clock = int(data.get("firstClock") or 0)
+        last_clock = int(data.get("lastClock") or (first_clock + num_cycles - 1))
+        all_active_runs = data.get("activeRuns", [])
+        selected_active_runs = []
+        count_deltas = [0] * (num_cycles + 1)
+        total_active_slots = 0
+
+        for dsp_index in range(dsp_start, dsp_end):
+            runs = all_active_runs[dsp_index] if dsp_index < len(all_active_runs) else []
+            clipped_runs = []
+            for run in runs:
+                if len(run) < 2:
+                    continue
+                run_start = max(0, min(num_cycles, int(run[0])))
+                run_end = max(0, min(num_cycles, int(run[1])))
+                if run_start >= run_end:
+                    continue
+                clipped_runs.append([run_start, run_end])
+                count_deltas[run_start] += 1
+                count_deltas[run_end] -= 1
+                total_active_slots += run_end - run_start
+            selected_active_runs.append(clipped_runs)
+
+        active_counts = []
+        active_count = 0
+        for cycle_index in range(num_cycles):
+            active_count += count_deltas[cycle_index]
+            active_counts.append(active_count)
+
+        total_slots = num_cycles * selected_dsps
+        utilization_percent = (total_active_slots / total_slots) * 100 if total_slots else 0
+
+        return {
+            "hasData": True,
+            "numDSPs": num_dsps,
+            "dspStart": dsp_start,
+            "dspEnd": dsp_end,
+            "numDSPsShown": selected_dsps,
+            "numCycles": num_cycles,
+            "firstClock": first_clock,
+            "lastClock": last_clock,
+            "totalActiveSlots": total_active_slots,
+            "utilizationPercent": utilization_percent,
+            "maxActiveDSPs": max(active_counts) if active_counts else 0,
+            "activeCounts": active_counts,
+            "activeRuns": selected_active_runs
+        }
+
+    raw_cycles = data.get("cycles", [])
+    if not raw_cycles:
+        return {
+            "hasData": False,
+            "message": "DSP activation tracking file is empty."
+        }
+
+    active_counts = []
+    active_runs = [[] for _ in range(selected_dsps)]
+    open_runs = [None] * selected_dsps
+    total_active_slots = 0
+    first_clock = int(raw_cycles[0].get("clockCycle", 0))
+    last_clock = first_clock
+
+    for cycle_index, entry in enumerate(raw_cycles):
+        last_clock = int(entry.get("clockCycle", first_clock + cycle_index))
+        active = entry.get("active", [])
+        active_count = 0
+
+        for local_dsp_index, dsp_index in enumerate(range(dsp_start, dsp_end)):
+            is_active = bool(active[dsp_index]) if dsp_index < len(active) else False
+            if is_active:
+                active_count += 1
+                if open_runs[local_dsp_index] is None:
+                    open_runs[local_dsp_index] = cycle_index
+            elif open_runs[local_dsp_index] is not None:
+                active_runs[local_dsp_index].append([open_runs[local_dsp_index], cycle_index])
+                open_runs[local_dsp_index] = None
+
+        active_counts.append(active_count)
+        total_active_slots += active_count
+
+    num_cycles = len(raw_cycles)
+    for local_dsp_index, run_start in enumerate(open_runs):
+        if run_start is not None:
+            active_runs[local_dsp_index].append([run_start, num_cycles])
+
+    total_slots = num_cycles * selected_dsps
+    utilization_percent = (total_active_slots / total_slots) * 100 if total_slots else 0
+
+    return {
+        "hasData": True,
+        "numDSPs": num_dsps,
+        "dspStart": dsp_start,
+        "dspEnd": dsp_end,
+        "numDSPsShown": selected_dsps,
+        "numCycles": num_cycles,
+        "firstClock": first_clock,
+        "lastClock": last_clock,
+        "totalActiveSlots": total_active_slots,
+        "utilizationPercent": utilization_percent,
+        "maxActiveDSPs": max(active_counts) if active_counts else 0,
+        "activeCounts": active_counts,
+        "activeRuns": active_runs
+    }
+
+
 class SnapshotHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         return
@@ -691,6 +1152,18 @@ class SnapshotHandler(BaseHTTPRequestHandler):
             query = parse_qs(parsed.query)
             cycle = query.get("cycle", [""])[0]
             self.send_json(read_snapshot_message(cycle))
+            return
+
+        if parsed.path == "/api/dsp-activations":
+            query = parse_qs(parsed.query)
+            cycle = query.get("cycle", [""])[0]
+            dsp_start = int(query.get("dsp_start", ["0"])[0])
+            dsp_count_arg = query.get("dsp_count", [None])[0]
+            dsp_count = int(dsp_count_arg) if dsp_count_arg is not None else None
+            try:
+                self.send_json(read_dsp_activations(cycle, dsp_start, dsp_count))
+            except Exception as error:
+                self.send_json({"hasData": False, "error": str(error)}, status=400)
             return
 
         if parsed.path == "/api/memory":

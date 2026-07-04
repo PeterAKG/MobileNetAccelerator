@@ -16,6 +16,7 @@ from typing import List
 df = pd.read_excel('MobileNetV3Calc.xlsx')
 
 NUM_MISC_LAYERS = 4
+TRACKING_MODE_ON = True
 
 layers = 39
 layerList = np.zeros(layers, dtype="U20")
@@ -28,11 +29,14 @@ spatialInput = np.zeros(layers, dtype=int)
 squeezeExcite = np.zeros(layers, dtype=int)
 SEhiddenLayer = np.zeros(layers, dtype=int)
 SRAMStartIndex = np.zeros(layers, dtype=int)
+SEDSPsNeeded = np.zeros(layers, dtype=int)
+SEWEIGHTTOTALBYTES = int(df.loc[35, "SE Total NN Size (Bytes)"])
 clkCycles = 0
 
 clockHz = 300000000 # 300 MHZ Clock speed
 convType = Literal["depthwise", "pointwise", "fullyConnected"]
 ActivationType = Literal["depthwise", "pointwise"]
+SEVectorType = Literal["input", "output"]
 
 for idx, row in df.iterrows():
     if(idx >= 0 and idx <= 37):
@@ -49,6 +53,7 @@ for idx, row in df.iterrows():
         if(row["SE"] == "Yes"):
             squeezeExcite[idx] = 1
             SEhiddenLayer[idx] = int(row["SE Hidden Layer"])
+            SEDSPsNeeded[idx] = int(row["SEDSPsNeeded"])
         else:
             squeezeExcite[idx] = 0
         SRAMStartIndex[idx] = int(row["SRAM Activation Start Index"])
@@ -56,6 +61,7 @@ for idx, row in df.iterrows():
 
 DEPTHWISE_KERNEL_PARTS = 9
 POINTWISE_KERNEL_PARTS = 9
+SE_VECTOR_CHUNK_PARTS = 9
 
 def makeJSONSerializable(value):
     if (value is None):
@@ -110,6 +116,11 @@ class SEWeight:
     column: int = -1
 
 @dataclass
+class SEKernel:
+    type: Literal["SE"] = field(default="SE", init=False)
+    weights: List[SEWeight] = field(default_factory=list)
+
+@dataclass
 class FullyConnectedWeight:
     type: Literal["fullyConnected"] = field(default="fullyConnected", init=False)
     layer: int = -1
@@ -125,7 +136,8 @@ Weight = Union[
 
 Kernel = Union[
     DepthwiseKernel,
-    PointwiseKernel
+    PointwiseKernel,
+    SEKernel
 ]
 
 # Channel argument refers to the input channel
@@ -136,6 +148,7 @@ class Activation:
     x: int
     y: int
     channel: int
+    value: np.uint8 = np.uint8(1)
     
 @dataclass
 class ActivationChunk:
@@ -144,7 +157,19 @@ class ActivationChunk:
     x: int = -1
     y: int = -1
     channel: int = -1
-    channelChunk: int = -1   # For pointwise it represents the lowest channel. 
+    channelChunk: int = -1   # For pointwise it represents the lowest channel.
+
+@dataclass
+class SEVectorIndex:
+    type: SEVectorType
+    layer: int = -1
+    channel: int = -1
+
+@dataclass
+class SEVectorChunk:
+    type: SEVectorType
+    layer: int = -1
+    channel: int = -1   # represents the lowest channel of the group of 9
 
 @dataclass
 class PartialActivation:
@@ -196,6 +221,15 @@ class PointwiseConvOperation:
     step: int = 0
 
 @dataclass
+class SEVectorProdOperation:
+    layer: int
+    tag: int
+    vectorLoaded: bool
+    weightsLoaded: int = 0
+    currentLoadingIndex: int = 0
+    currentUnloadingIndex: int = 0
+
+@dataclass
 class FullyConnectedOperation:
     type: Literal["fullyConnected"]
     layer: int
@@ -208,7 +242,22 @@ Operation = Union[
     DepthwiseConvOperation,
     CameraDepthwiseConvOperation,
     PointwiseConvOperation,
+    SEVectorProdOperation,
     FullyConnectedOperation,
+]
+
+@dataclass
+class LoadSEWeightsMemOp:
+    DSPtag: int
+    memTag: int
+    isExpansion: bool
+    layer: int
+    weightsPerDSP: int
+    weightsLoaded: int
+    DSPindexStart: int = 0
+
+MemoryOperation = Union[
+    LoadSEWeightsMemOp
 ]
 
 class SRAM:
@@ -373,6 +422,7 @@ class pixelHistorian:
         self.height = height
         self.depth = depth
         self.pixelHistoryMap = np.zeros((width, height, depth), dtype=bool)
+        self.SEVectorCalculated = np.zeros(depth, dtype=bool)
         self.layerForSlot = np.arange(depth, dtype=int)
         self.lastCompletedLayer = -1
         self.layerPointer = 0
@@ -411,6 +461,7 @@ class pixelHistorian:
             self.lastCompletedLayer = completedLayer
             nextLayer = self.lastCompletedLayer + self.depth
             self.pixelHistoryMap[:, :, self.layerPointer] = False
+            self.SEVectorCalculated[self.layerPointer] = False
             self.layerForSlot[self.layerPointer] = nextLayer
             self.layerPointer = (self.layerPointer + 1) % self.depth
             completedLayer = int(self.layerForSlot[self.layerPointer])
@@ -445,6 +496,22 @@ class pixelHistorian:
             raise Exception("ERROR! Quarter must be 1, 2, 3, or 4")
 
         return bool(self.pixelHistoryMap[xStart:xEnd, yStart:yEnd, layerSlot].all())
+
+    def isLayerFinished(self, layer):
+        if (layer < 0):
+            raise Exception("ERROR! Pixel layer cannot be negative")
+        return layer <= self.lastCompletedLayer
+
+    def setSEVectorCalculated(self, layer, calculated=True):
+        layerSlot = self.getLayerSlot(layer)
+        self.SEVectorCalculated[layerSlot] = calculated
+
+    def isSEVectorCalculated(self, layer):
+        layerSlot = self.getLayerSlot(layer)
+        return bool(self.SEVectorCalculated[layerSlot])
+    
+    def getLastCompletedLayer(self):
+        return self.lastCompletedLayer
 
 pixelMap = pixelHistorian(PIXEL_HISTORY_MAP_SIZE, PIXEL_HISTORY_MAP_SIZE, PIXEL_HISTORY_MAP_DEPTH)
 
@@ -521,6 +588,10 @@ class DSPunit:
         self.activationChunk = ActivationChunk(type="Depthwise")
         
         self.preloadedActivationChunk = ActivationChunk(type="Depthwise")
+
+        self.preAdder = SEVectorChunk(type="input")
+
+        self.preloadedPreAdder = SEVectorChunk(type="input")
         
         # Amount of time it takes until it has multiplied all together. When self.timer == 0, it is finished
         self.timer = -1
@@ -535,17 +606,46 @@ class DSPunit:
         # Operation tag -- used for the DSPmanager to mark which operations correspond to which DSPunits
         self.operationTag = None
         
-    def preloadKernel(self, kernel: Kernel):        
-        self.preloadedKernel = kernel
+    def preloadKernel(self, kernel: Kernel):
+        if (isinstance(kernel, SEKernel)):
+            self.preloadedKernel = SEKernel(weights=kernel.weights.copy())
+        else:
+            self.preloadedKernel = kernel
     
     def loadKernel(self):
-        self.kernel = replace(self.preloadedKernel)
+        if (isinstance(self.preloadedKernel, SEKernel)):
+            self.kernel = SEKernel(weights=self.preloadedKernel.weights.copy())
+        else:
+            self.kernel = replace(self.preloadedKernel)
+        self.preloadedKernel = DepthwiseKernel()
     
     def preloadActivation(self, activationChunk: ActivationChunk):
         self.preloadedActivationChunk = activationChunk
         
     def loadActivation(self):
         self.activationChunk = replace(self.preloadedActivationChunk)
+
+    def preloadPreAdder(self, seVectorChunk: SEVectorChunk):
+        if (not isinstance(seVectorChunk, SEVectorChunk)):
+            raise Exception("ERROR! DSP pre-adder must be preloaded with an SEVectorChunk")
+
+        self.preloadedPreAdder = replace(seVectorChunk)
+
+    def loadPreAdder(self):
+        self.preAdder = replace(self.preloadedPreAdder)
+
+    def validatePreAdderForActivation(self):
+        if (squeezeExcite[self.activationChunk.layer] != 1):
+            return
+
+        if (not isinstance(self.preAdder, SEVectorChunk)):
+            raise Exception("ERROR! Squeeze-excite activation started without a loaded DSP pre-adder SE vector chunk")
+        if (self.preAdder.layer != self.activationChunk.layer):
+            raise Exception("ERROR! Squeeze-excite DSP pre-adder layer does not match activation chunk layer")
+
+        expectedChannel = (self.activationChunk.channel // SE_VECTOR_CHUNK_PARTS) * SE_VECTOR_CHUNK_PARTS
+        if (self.preAdder.channel != expectedChannel):
+            raise Exception("ERROR! Squeeze-excite DSP pre-adder channel does not match activation chunk channel")
         
     def startDotProduct(self):
         if (isinstance(self.kernel, PointwiseKernel)):
@@ -564,6 +664,7 @@ class DSPunit:
         elif (self.isActive()):
             raise Exception("ERROR! DSP Slice attempted to start while already being active!")
         else:
+            self.validatePreAdderForActivation()
             self.timer = 8
             self.lastTimerUpdateClockCycle = clkCycles
             
@@ -652,6 +753,11 @@ class DSPmanager:
         self.operationFIFO = deque()
         
         self.tagCounter = 0
+        self.DSPActivationFirstClock = None
+        self.DSPActivationLastClock = None
+        self.DSPActivationCycleCount = 0
+        self.DSPActiveRuns = [[] for _ in range(NUM_DSPS)]
+        self.DSPOpenRunStarts = [None] * NUM_DSPS
     
     def getFreeDSPunits(self, max=None):
         freeDSPs = [dsp for dsp in self.DSPlist if (not dsp.isActive() and dsp.getOperationTag() is None)]
@@ -679,8 +785,9 @@ class DSPmanager:
     def fifoPop(self) -> Operation:
         return self.operationFIFO.pop()
     
-    def fifoPeek(self) -> Operation:
-        return self.operationFIFO[-1]
+    def fifoPeek(self, distanceFromTop) -> Operation:
+        index = -(distanceFromTop + 1)
+        return self.operationFIFO[index]
     
     def fifoCheckLen(self) -> int:
         return len(self.operationFIFO)
@@ -707,94 +814,183 @@ class DSPmanager:
         
         return True
 
-    # I am going to go to the gym now, but what I need to do next is have a function which updates the DSPmanager,
-    # meaning that the next operation is performed / updated. And then discarded when finished. That same function
-    # is also going to need to do further processing on the operation so that it knows exactly what to do with each DSP
-    # like... I don't include all necessary info per operation. I expect some processing will need to be done for each
-    # instruction
-    def processOperation(self):
-        if (self.fifoCheckLen() == 0):
-            return
-
-        operation = self.fifoPeek()
+    def startSEVectorCalc(self, layer):
+        if (not pixelMap.isLayerFinished(layer)):
+            # May want to remove this later to see how calculating SE vector with uncomplete averages
+            # affects performance
+            raise Exception("Trying to calculate SE Vector of unfinished layer")
         
-        # Depthwise convolutions go left to right, top to bottom
-        INITIAL_CONVOLUTION_K = 3
-        if isinstance(operation, CameraDepthwiseConvOperation):
-            kernelRadius = INITIAL_CONVOLUTION_K // 2
-            cameraActivationList = []
-            for height in range(INITIAL_CONVOLUTION_K):
-                for width in range(INITIAL_CONVOLUTION_K):
-                    activationX = operation.targetX + (width - kernelRadius)
-                    activationY = operation.targetY + (height - kernelRadius)
-                    if (activationX < 0 or activationX >= imxCamera.width):
-                        continue
-                    if (activationY < 0 or activationY >= imxCamera.height):
-                        continue
-                    cameraActivation = imxCamera.getActivation(activationX, activationY)
-                    cameraActivationList.append(cameraActivation)
-            activationChunk = memory.activationToActivationChunk(cameraActivationList)
+        freeDSPs = self.getFreeDSPunits()
+        
+        if (len(freeDSPs) != SEDSPsNeeded[layer]):
+            return False
             
-            DSPunits = self.getDSPsWithOpTag(operation.tag)
+        self.assignOperationTag(freeDSPs, self.tagCounter)
+        SEVectorProdOp = SEVectorProdOperation(layer=layer, tag=self.tagCounter)
+        self.tagCounter += 1
+        
+        self.fifoPush(SEVectorProdOp)
+        
+        return True
+
+    def processOperation(self):
+        toCheck = self.fifoCheckLen()
+        
+        if (toCheck == 0):
+            return
+        
+        fifoIndex = 0
+
+        while (toCheck > 0):
+            operation = self.fifoPeek(fifoIndex)
             
-            if (operation.activationsLoaded == False):
-                channel = 0
-                for DSPunit in DSPunits:
-                    DSPActivationChunk = replace(activationChunk, channel=channel)
-                    DSPunit.preloadActivation(DSPActivationChunk)
-                    channel += 1
-                operation.activationsLoaded = True
-            
-            if (len(DSPunits) != channelsOut[0]):
-                raise Exception("Camera Depthwise Conv Op attempted without 18 DSP units")
-            
-            if (operation.nextToRead == channelsOut[0]):
-                for DSPunit in DSPunits:
-                    DSPunit.setOperationTag(None)
-                pixelMap.setPixelFinished(operation.targetX, operation.targetY, 0)
-                self.fifoPop()
-                return
-            
-            if (operation.nextToRead < operation.nextToTrigger):
-                for channel in range(operation.nextToRead, operation.nextToTrigger):
-                    DSPtoRead = DSPunits[channel]
-                    
-                    if (DSPtoRead.isActive() == True):
-                        break
-                    
-                    if (DSPtoRead.isActive() == False):
-                        # Load activation from DSP to SRAM
-                        if (memory.loadActivationFromDSP(DSPtoRead) == False):
+            # Depthwise convolutions go left to right, top to bottom
+            INITIAL_CONVOLUTION_K = 3
+            if isinstance(operation, CameraDepthwiseConvOperation):
+                kernelRadius = INITIAL_CONVOLUTION_K // 2
+                cameraActivationList = []
+                for height in range(INITIAL_CONVOLUTION_K):
+                    for width in range(INITIAL_CONVOLUTION_K):
+                        activationX = operation.targetX + (width - kernelRadius)
+                        activationY = operation.targetY + (height - kernelRadius)
+                        if (activationX < 0 or activationX >= imxCamera.width):
+                            continue
+                        if (activationY < 0 or activationY >= imxCamera.height):
+                            continue
+                        cameraActivation = imxCamera.getActivation(activationX, activationY)
+                        cameraActivationList.append(cameraActivation)
+                activationChunk = memory.activationToActivationChunk(cameraActivationList)
+                
+                DSPunits = self.getDSPsWithOpTag(operation.tag)
+                
+                if (operation.activationsLoaded == False):
+                    channel = 0
+                    for DSPunit in DSPunits:
+                        DSPActivationChunk = replace(activationChunk, channel=channel)
+                        DSPunit.preloadActivation(DSPActivationChunk)
+                        channel += 1
+                    operation.activationsLoaded = True
+                
+                if (len(DSPunits) != channelsOut[0]):
+                    raise Exception("Camera Depthwise Conv Op attempted without 18 DSP units")
+                
+                if (operation.nextToRead == channelsOut[0]):
+                    for DSPunit in DSPunits:
+                        DSPunit.setOperationTag(None)
+                    pixelMap.setPixelFinished(operation.targetX // stride[0], operation.targetY // stride[0], 0)
+                    self.fifoPop()
+                    fifoIndex -= 1
+                    return
+                
+                if (operation.nextToRead < operation.nextToTrigger):
+                    for channel in range(operation.nextToRead, operation.nextToTrigger):
+                        DSPtoRead = DSPunits[channel]
+                        
+                        if (DSPtoRead.isActive() == True):
                             break
                         
-                        operation.nextToRead += 1
+                        if (DSPtoRead.isActive() == False):
+                            # Load activation from DSP to SRAM
+                            if (memory.loadActivationFromDSP(DSPtoRead) == False):
+                                break
+                            
+                            operation.nextToRead += 1
+                
+                if (operation.nextToTrigger < operation.nextToLoad):
+                    for channel in range(operation.nextToTrigger, operation.nextToLoad):
+                        DSPtoTrigger = DSPunits[channel]
+                        
+                        if (DSPtoTrigger.isActive()):
+                            break
+                        
+                        DSPtoTrigger.loadKernel()
+                        DSPtoTrigger.loadActivation()
+                        DSPtoTrigger.startDotProduct()
+                        operation.nextToTrigger += 1
+                
+                if (operation.nextToLoad != channelsOut[0]):
+                    for channel in range(operation.nextToLoad, channelsOut[0]):
+                        
+                        desiredKernel = DepthwiseKernel(layer=0, channel=channel)
+                        
+                        result = memory.askForKernel(desiredKernel, DSPunits[channel].getID())
+                        
+                        if (result == False):
+                            break
+                        
+                        operation.nextToLoad += 1
             
-            if (operation.nextToTrigger < operation.nextToLoad):
-                for channel in range(operation.nextToTrigger, operation.nextToLoad):
-                    DSPtoTrigger = DSPunits[channel]
-                    
-                    if (DSPtoTrigger.isActive()):
-                        break
-                    
-                    DSPtoTrigger.loadKernel()
-                    DSPtoTrigger.loadActivation()
-                    DSPtoTrigger.startDotProduct()
-                    operation.nextToTrigger += 1
-            
-            if (operation.nextToLoad != channelsOut[0]):
-                for channel in range(operation.nextToLoad, channelsOut[0]):
-                    
-                    desiredKernel = DepthwiseKernel(layer=0, channel=channel)
-                    
-                    result = memory.askForKernel(desiredKernel, DSPunits[channel].getID())
-                    
-                    if (result == False):
-                        break
-                    
-                    operation.nextToLoad += 1
+# @dataclass
+# class SEVectorProdOperation:
+#     layer: int
+#     tag: int
+#     vectorLoaded: bool
+#     weightsLoaded: int = 0
+#     currentLoadingIndex: int = 0
+#     currentUnloadingIndex: int = 0
+
+            if isinstance(operation, SEVectorProdOperation):
+                # For each DSPUnit involved (AKA -- all DSPUnits), you need to be counting how many weights it has
+                # already consumed.
+                # The issue with that line of reasoning is: 292 DSPs * 43 weights per DSP = 12556 bits = 12 kbits out of 320 kbits
+                # I think it's more practical to just have one global number representing how many weights each DSP has
+                # consumed. And the DSP just fills left to right top to bottom, and once it reaches the last DSP, it's like
+                # "Ok -- time to increment the counter by one and move onto the next batch"
+                # Yes -- and actually weight bandwidth should not be a problem since each DSP takes 9 cycles to finish.
+                # Also -- we probably need to add some functionality to the DSPUnit that it automatically starts the next
+                # batch if it has stuff preloaded, and has a flag saying "Hey! I have space to preload the next batch!"
+                
+                if (not operation.vectorLoaded):
+                    pass
+                
+                
+            fifoIndex += 1
+            toCheck -= 1
     
+    def trackDSPActivations(self):
+        if (not TRACKING_MODE_ON):
+            return
+
+        if (self.DSPActivationFirstClock is None):
+            self.DSPActivationFirstClock = int(clkCycles)
+
+        cycleIndex = self.DSPActivationCycleCount
+        for dspIndex, dsp in enumerate(self.DSPlist):
+            isActive = bool(dsp.isActive())
+            if (isActive and self.DSPOpenRunStarts[dspIndex] is None):
+                self.DSPOpenRunStarts[dspIndex] = cycleIndex
+            elif ((not isActive) and self.DSPOpenRunStarts[dspIndex] is not None):
+                self.DSPActiveRuns[dspIndex].append([self.DSPOpenRunStarts[dspIndex], cycleIndex])
+                self.DSPOpenRunStarts[dspIndex] = None
+
+        self.DSPActivationLastClock = int(clkCycles)
+        self.DSPActivationCycleCount += 1
+
+    def exportDSPActivationHistoryAsJSON(self):
+        activeRuns = [[run[:] for run in dspRuns] for dspRuns in self.DSPActiveRuns]
+        for dspIndex, runStart in enumerate(self.DSPOpenRunStarts):
+            if (runStart is not None):
+                activeRuns[dspIndex].append([runStart, self.DSPActivationCycleCount])
+
+        return {
+            "format": "active-runs-v1",
+            "numDSPs": NUM_DSPS,
+            "firstClock": self.DSPActivationFirstClock,
+            "lastClock": self.DSPActivationLastClock,
+            "numCycles": self.DSPActivationCycleCount,
+            "activeRuns": activeRuns
+        }
+
+    def flushDSPActivationHistory(self):
+        self.DSPActivationFirstClock = None
+        self.DSPActivationLastClock = None
+        self.DSPActivationCycleCount = 0
+        self.DSPActiveRuns = [[] for _ in range(NUM_DSPS)]
+        self.DSPOpenRunStarts = [None] * NUM_DSPS
+
     def update(self):
         self.processOperation()
+        self.trackDSPActivations()
 
 DSPMngr = DSPmanager()
 
@@ -806,6 +1002,7 @@ MAX_SIMULTANEOUS_SRAM_WRITES = NUM_SRAMS
 
 WEIGHTS_PER_LRAM_ADDRESS = 4
 SE_WEIGHTS_PER_SRAM_ADDRESS = 2
+MAX_SQUEEZE_EXCITE_CHANNELS = 243
 class memoryManager:
     
     #SRAM will be used for activation, and LRAM for weight
@@ -832,6 +1029,67 @@ class memoryManager:
         # This is for finding weights
         self.startOfLayer = np.zeros((layers, 3), dtype=int)
         self.startOfSELayer = np.zeros((layers, 3), dtype=int)
+
+        self.squeezeExciteAccumulator = np.zeros(MAX_SQUEEZE_EXCITE_CHANNELS)
+        self.squeezeExciteAccumulatorCount = np.zeros(MAX_SQUEEZE_EXCITE_CHANNELS, dtype=int)
+        
+        self.operationFIFO = deque()
+        self.memTagPushCounter = 0
+        self.memTagPopCounter = 0
+
+    def addActivationToSqueezeExciteAccumulator(self, activation: Activation):
+        if (squeezeExcite[activation.layer] != 1):
+            return
+        if (activation.channel < 0 or activation.channel >= MAX_SQUEEZE_EXCITE_CHANNELS):
+            raise Exception("ERROR! Activation channel is outside the squeeze-excite accumulator range")
+
+        self.squeezeExciteAccumulator[activation.channel] += activation.value
+        self.squeezeExciteAccumulatorCount[activation.channel] += 1
+
+    def clearAccumulator(self):
+        self.squeezeExciteAccumulator.fill(0)
+        self.squeezeExciteAccumulatorCount.fill(0)
+
+    def readAveragedChannel(self, layer, channel):
+        if (layer < 0 or layer >= layers):
+            raise Exception("ERROR! SE vector layer is outside the layer range")
+        if (channel < 0 or channel >= channelsOut[layer]):
+            raise Exception("ERROR! SE vector channel is outside the layer channel range")
+
+        accumulatedChannels = np.count_nonzero(self.squeezeExciteAccumulatorCount)
+        if (accumulatedChannels != channelsOut[layer]):
+            raise Exception("ERROR! Number of accumulated channels does not match the number of channels in the layer")
+
+        return SEVectorIndex(type="input", layer=layer, channel=channel)
+
+    def getSEVectorSRAMLocation(self, SEVectorIndex: SEVectorIndex) -> tuple[int, int, int]:
+        if (SEVectorIndex.channel < 0 or SEVectorIndex.channel >= MAX_SQUEEZE_EXCITE_CHANNELS):
+            raise Exception("ERROR! SE vector channel is outside the SE vector SRAM range")
+
+        trueIndex = SEWEIGHTTOTALBYTES + SEVectorIndex.channel
+        packedIndex = trueIndex % SE_WEIGHTS_PER_SRAM_ADDRESS
+        SRAMJumps = trueIndex // SE_WEIGHTS_PER_SRAM_ADDRESS
+        SRAMNum = SRAMJumps % NUM_SRAMS
+        SRAMAddr = SRAMJumps // NUM_SRAMS
+
+        return (SRAMNum, SRAMAddr, packedIndex)
+
+    def loadSEVectorPart(self, SEVectorIndex: SEVectorIndex):
+        SEVectorLocation = self.getSEVectorSRAMLocation(SEVectorIndex)
+
+        SRAMNum = SEVectorLocation[0]
+        SRAMAddr = SEVectorLocation[1]
+        packedIndex = SEVectorLocation[2]
+        SRAMobj = self.allSRAM[SRAMNum]
+
+        if (SRAMobj.isActiveRead() or SRAMobj.isActiveWrite()):
+            return False
+
+        packedSEVectorParts = list(SRAMobj.readSRAM(SRAMAddr))
+        packedSEVectorParts[packedIndex] = SEVectorIndex
+        SRAMobj.writeSRAM(SRAMAddr, packedSEVectorParts)
+
+        return True
     
     # This function takes a list of DSPunits and a list of weights, and loads the DSP units with weights as efficiently as possible
     def loadWeightsToDSP(self, DSPunits, weightList):
@@ -963,6 +1221,52 @@ class memoryManager:
                 
         return True
 
+    def readSEWeightsSequentially(self, SRAMNum, SRAMAddr, packedIndex, numReads, weightsRead):
+        if (packedIndex < 0 or packedIndex >= SE_WEIGHTS_PER_SRAM_ADDRESS):
+            raise Exception("ERROR! packedIndex is outside the SRAM packed address")
+        if (numReads < 0):
+            raise Exception("ERROR! numReads cannot be negative")
+
+        currentSRAMNum = SRAMNum
+        currentAddr = SRAMAddr
+        currentIndex = packedIndex
+
+        while (len(weightsRead) < numReads):
+            SRAMobj = self.allSRAM[currentSRAMNum]
+
+            if (SRAMobj.isActiveRead()):
+                return False
+
+            fullRead = SRAMobj.readSRAM(currentAddr)
+
+            while (currentIndex < SE_WEIGHTS_PER_SRAM_ADDRESS and len(weightsRead) < numReads):
+                weightsRead.append(fullRead[currentIndex])
+                currentIndex += 1
+
+            currentIndex = 0
+            currentSRAMNum += 1
+            if (currentSRAMNum >= NUM_SRAMS):
+                currentSRAMNum = 0
+                currentAddr += 1
+
+        return True
+
+    def offsetSESRAMLocation(self, SRAMNum, SRAMAddr, packedIndex, offset):
+        if (packedIndex < 0 or packedIndex >= SE_WEIGHTS_PER_SRAM_ADDRESS):
+            raise Exception("ERROR! packedIndex is outside the SRAM packed address")
+        if (offset < 0):
+            raise Exception("ERROR! SRAM offset cannot be negative")
+
+        totalPackedIndex = packedIndex + offset
+        SRAMJumps = totalPackedIndex // SE_WEIGHTS_PER_SRAM_ADDRESS
+        newPackedIndex = totalPackedIndex % SE_WEIGHTS_PER_SRAM_ADDRESS
+
+        logicalSRAM = SRAMNum + SRAMJumps
+        newSRAMNum = logicalSRAM % NUM_SRAMS
+        newSRAMAddr = SRAMAddr + (logicalSRAM // NUM_SRAMS)
+
+        return (newSRAMNum, newSRAMAddr, newPackedIndex)
+
     def weightsToKernel(self, weightList):
         if (len(weightList) != POINTWISE_KERNEL_PARTS):
             raise Exception("ERROR! Kernel must be made from exactly 9 weights")
@@ -1086,7 +1390,6 @@ class memoryManager:
                 channelChunk=lowestChannel)
 
         raise Exception("ERROR! Unsupported activation type for activation chunk conversion")
-    
 
     def askForKernel(self, kernel: Kernel, id):
         # We basically need to bridge the gap between the start of the layer and the
@@ -1226,6 +1529,8 @@ class memoryManager:
         packedActivations[activation1Location[2]] = activation1
         packedActivations[activation2Location[2]] = activation2
         SRAMobj.writeSRAM(SRAMAddr, packedActivations)
+        self.addActivationToSqueezeExciteAccumulator(activation1)
+        self.addActivationToSqueezeExciteAccumulator(activation2)
 
         return True
 
@@ -1243,8 +1548,95 @@ class memoryManager:
         packedActivations = list(SRAMobj.readSRAM(SRAMAddr))
         packedActivations[packedIndex] = activation
         SRAMobj.writeSRAM(SRAMAddr, packedActivations)
+        self.addActivationToSqueezeExciteAccumulator(activation)
 
         return True
+
+    def pushMemoryOp(self, memoryOp: MemoryOperation):
+        self.operationFIFO.appendleft(memoryOp)
+    
+    def popMemoryOp(self) -> MemoryOperation:
+        return self.operationFIFO.pop()
+    
+    def peekMemoryOp(self, distanceFromTop) -> MemoryOperation:
+        index = -(distanceFromTop + 1)
+        return self.operationFIFO[index]
+    
+    def processMemoryOp(self):
+        
+        memoryOp = self.peekMemoryOp(0)
+        
+        if (isinstance(memoryOp, LoadSEWeightsMemOp)):
+            DSPunits = DSPMngr.getDSPsWithOpTag(memoryOp.DSPtag)
+            if (len(DSPunits) != NUM_DSPS):
+                raise Exception("ERROR! LoadSEWeightsMemOp must load all DSP units")
+            if (memoryOp.weightsPerDSP < 0):
+                raise Exception("ERROR! LoadSEWeightsMemOp weightsPerDSP cannot be negative")
+            if (memoryOp.weightsLoaded < 0):
+                raise Exception("ERROR! LoadSEWeightsMemOp weightsLoaded cannot be negative")
+            if (memoryOp.DSPindexStart < 0 or memoryOp.DSPindexStart > NUM_DSPS):
+                raise Exception("ERROR! LoadSEWeightsMemOp DSPindexStart is outside the DSP range")
+
+            layerStart = self.startOfSELayer[memoryOp.layer]
+            matrixOffset = 0
+            if (memoryOp.isExpansion):
+                matrixOffset = channelsOut[memoryOp.layer] * SEhiddenLayer[memoryOp.layer]
+
+            trueStartOffset = matrixOffset + memoryOp.weightsLoaded
+            startLocation = self.offsetSESRAMLocation(
+                layerStart[0],
+                layerStart[1],
+                layerStart[2],
+                trueStartOffset)
+
+            for dspIndex in range(memoryOp.DSPindexStart, len(DSPunits)):
+                DSPunit = DSPunits[dspIndex]
+                hasSEKernelLoaded = isinstance(DSPunit.kernel, SEKernel)
+                hasSEKernelPreloaded = isinstance(DSPunit.preloadedKernel, SEKernel)
+
+                if (hasSEKernelLoaded and hasSEKernelPreloaded):
+                    raise Exception("ERROR! DSP unit has no space for SE weights")
+                if ((not hasSEKernelLoaded) and hasSEKernelPreloaded):
+                    raise Exception("ERROR! DSP unit has preloaded SE weights without loaded SE weights")
+
+                maxWeightsToLoad = 18
+                if (hasSEKernelLoaded):
+                    maxWeightsToLoad = 9
+
+                weightsToLoad = min(memoryOp.weightsPerDSP, maxWeightsToLoad)
+                dspStartLocation = self.offsetSESRAMLocation(
+                    startLocation[0],
+                    startLocation[1],
+                    startLocation[2],
+                    dspIndex * memoryOp.weightsPerDSP)
+
+                weights = []
+                success = self.readSEWeightsSequentially(
+                    dspStartLocation[0],
+                    dspStartLocation[1],
+                    dspStartLocation[2],
+                    weightsToLoad,
+                    weights)
+
+                if (success == False):
+                    memoryOp.DSPindexStart = dspIndex
+                    return False
+
+                if (any(weight is None for weight in weights)):
+                    raise Exception("ERROR! Cannot load empty SE weight into DSP")
+
+                SEKernelToLoad = SEKernel(weights=weights)
+                if (hasSEKernelLoaded):
+                    DSPunit.preloadKernel(SEKernelToLoad)
+                else:
+                    DSPunit.preloadKernel(SEKernelToLoad)
+                    DSPunit.loadKernel()
+
+                memoryOp.DSPindexStart = dspIndex + 1
+
+            self.popMemoryOp()
+            self.memTagPushCounter += 1
+            return True
             
 def exportToJSON(memoryManagerObj, message="", rootDirectory="snapshots"):
     rootPath = Path(rootDirectory)
@@ -1266,6 +1658,11 @@ def exportToJSON(memoryManagerObj, message="", rootDirectory="snapshots"):
 
     with (clockCycleDirectory / "message.json").open("w", encoding="utf-8") as jsonFile:
         json.dump({"message": message}, jsonFile, indent=2)
+
+    if (TRACKING_MODE_ON):
+        with (clockCycleDirectory / "DSPActivations.json").open("w", encoding="utf-8") as jsonFile:
+            json.dump(DSPMngr.exportDSPActivationHistoryAsJSON(), jsonFile, separators=(",", ":"))
+        DSPMngr.flushDSPActivationHistory()
 
     rootPath.mkdir(parents=True, exist_ok=True)
     startOfLayerData = []
@@ -1484,7 +1881,7 @@ for misc_layer in range(MISC_LAYER_START, layers):
 
 memory.flushWeightsInStart()
 
-# Add here -- for each layer with Squeeze-Excite, store the squeeze excite neural net
+# Code below: stores the squeeze excite neural net
 # The neural network is composed of two matrices. One of size
 # (Output Channel x SE Hidden Layer size)
 # one of size
@@ -1542,50 +1939,89 @@ inferenceCompleted = False
 imageJustIn = True
 
 while (inferenceCompleted == False):
-
+    
+    # Special first layer logic
     if (pixelsComputed < spatialOutput[0] ** 2):
         imxCamera.updateCamera()
         
         pixelNumber = imxCamera.pixelNumber()
         if (pixelNumber < 0):
-            continue
-
-        # This is the next input pixel the stride lands on.
-        targetOutputX = pixelsComputed % spatialOutput[0]
-        targetOutputY = pixelsComputed // spatialOutput[0]
-
-        targetX = targetOutputX * stride[0]
-        targetY = targetOutputY * stride[0]
-
-        kernelRadius = kernelSize[0] // 2
-        lastNeededX = min(targetX + kernelRadius, imxCamera.width - 1)
-        lastNeededY = min(targetY + kernelRadius, imxCamera.height - 1)
-        lastNeededPixel = imxCamera.xyToPixelCounter(lastNeededX, lastNeededY)
-
-        if (pixelNumber < lastNeededPixel):
-            continue
-        
-        print(f"targetX: {targetX}, targetY: {targetY}\n")
-        if (DSPMngr.startDepthwiseConvFromCamera(targetX, targetY, imxCamera)):
-            pixelsComputed += 1
-        else:
             pass
+        else:
+            # This is the next input pixel the stride lands on.
+            targetOutputX = pixelsComputed % spatialOutput[0]
+            targetOutputY = pixelsComputed // spatialOutput[0]
+
+            targetX = targetOutputX * stride[0]
+            targetY = targetOutputY * stride[0]
+
+            kernelRadius = kernelSize[0] // 2
+            lastNeededX = min(targetX + kernelRadius, imxCamera.width - 1)
+            lastNeededY = min(targetY + kernelRadius, imxCamera.height - 1)
+            lastNeededPixel = imxCamera.xyToPixelCounter(lastNeededX, lastNeededY)
+            
+            print(f"cycles: {clkCycles}, targetX: {targetX}, targetY: {targetY}, pixelCounter: {pixelNumber}, pixelXY: {imxCamera.pixelCounterToXY(pixelNumber)}\n")
+
+            if (pixelNumber < lastNeededPixel):
+                pass
+            else:
+                if (DSPMngr.startDepthwiseConvFromCamera(targetX, targetY, imxCamera)):
+                    pixelsComputed += 1
     else:
+        break
         if (imageJustIn):
             exportToJSON(memory, "image just recieved")
             imageJustIn = False
+    
+    # Universal logic
+    # Write code that gets the last completed layer from the pixel historian,
+    # If the last completed layer is an SE layer, then check whether the SE vector for that layer was completed.
+    #   If yes, then, load the SE vector into the DSP pre-adders appropriately (additive attention, need to add
+    #   support for pre-adding in the DSP units).
+    #   If no, then, do the SE layer
+    # If the last completed layer is not an SE layer, then just finish the next layer as soon as possible.
+    # And queue up operations for the layer after that.
+    # I seem to be forgetting that the job of the global controller is just to fill up a FIFO queue. It should have
+    # no knowledge of compute resources, that's the DSPManager's job.
+    
+    lastCompletedLayer = pixelMap.getLastCompletedLayer()
+    
+    if (squeezeExcite[lastCompletedLayer]):
+        if (not pixelMap.isSEVectorCalculated(lastCompletedLayer)):
+            pass
+            # Ask the DSPManager to calculate the SE vector for the layer, and store it somewhere
+            # That somewhere is the last 243 bytes of the reserved portion of SRAM
+            # So, there should be some DSP function called DSPMngr.calcSEVector(layer)
+            # That takes the average values of each channel and puts it into the neural network
+            # with the SE NN weights. Then it should load it into that space in memory
+            #
+            # Additionally, I need to add support for averaging each pixel in a channel as it is calculated.
+            # I think the best place to do this is in the memory manager, since it takes in all the activations.
+            # So, it can update the average as activations are loaded into the memory
+            #
+            # After I implement the pixel averaging, and the operation, I need to add support for pre-adders
+            # in the DSPUnits, as well as support for loading these pre-adders with weights. I think the best
+            # way to do this is to have the FIFO check if the layer is a squeeze-excite, assume that the vector
+            # has been calculated, and load the DSP Units with the SE vector in parallel to loading them with
+            # weights.
+        
+        # The pixel historian needs to track the existance of a SE vector for each layer. If it exists, grab it and
+        # use it. (feed into pre-adders).
+
+    
+    # Fully Connected Neural Net Logic
+    
     
     # I think what I need is an array showing which pixels are done computing on all channels. And it should go back three
     # layers. Once the oldest layer is done, it moves forward a layer. Then what we have is a way to track which layers
     # are complete, as well as which pixels are complete, so we know how to move forward.
     
     # Ok I did this -- a PixelHistorian class which stores the 3 next layers to be completed. Now I just need to think of
-    # some logic to interact with this class to determine
+    # some logic to interact with this class to determine how to move forward on the next layer
+    
+    # Also -- I need to add tracking to the operation queue as well to see how full it is getting.
     
     DSPMngr.update()
     clkCycles += 1
-    
-    if (DSPMngr.fifoCheckLen() == 0):
-        break
 
 exportToJSON(memory, "done with inference")
