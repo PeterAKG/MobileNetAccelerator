@@ -30,10 +30,28 @@ spatialInput = np.zeros(layers, dtype=int)
 squeezeExcite = np.zeros(layers, dtype=int)
 SEhiddenLayer = np.zeros(layers, dtype=int)
 SRAMStartIndex = np.zeros(layers, dtype=int)
-SEDSPsNeeded = np.zeros(layers, dtype=int)
 SEMACsPerDSP = np.zeros(layers, dtype=int)
+SEExciteMACsPerDSP = np.zeros(layers, dtype=int)
+SEExciteOutputChannelDivisor = np.ones(layers, dtype=int)
+pointwiseQuarterDivision = np.ones(layers, dtype=int)
+pointwiseSRAMScheme = np.zeros(layers, dtype="U20")
 SEWEIGHTTOTALBYTES = int(df.loc[35, "SE Total NN Size (Bytes)"])
+FULLY_CONNECTED_INPUT = int(df.loc[36, "In"])
+FULLY_CONNECTED_HIDDEN = int(df.loc[36, "Out"])
+FULLY_CONNECTED_OUTPUT = int(df.loc[37, "Out"])
+FULLY_CONNECTED_LAYER_START = layers - NUM_MISC_LAYERS + 1
+GAP_INPUT_LAYER = FULLY_CONNECTED_LAYER_START - 2
+fullyConnectedInputDivisor = np.zeros(2, dtype=int)
+fullyConnectedInputDivisor[0] = int(df.loc[36, "Fully Connected Divided Input"])
+fullyConnectedInputDivisor[1] = int(df.loc[37, "Fully Connected Divided Input"])
+fullyConnectedMACsPerDSP = np.zeros(2, dtype=int)
+fullyConnectedMACsPerDSP[0] = int(df.loc[36, "Fully Connected MACs / DSP"])
+fullyConnectedMACsPerDSP[1] = int(df.loc[37, "Fully Connected MACs / DSP"])
+
 clkCycles = 0
+
+POINTWISE_QUARTER_DIVISION_COLUMN = "Pointwise Divisions Per Quarter"
+DEPTHWISE_KERNEL_SIZE = 3
 
 clockHz = 300000000 # 300 MHZ Clock speed
 convType = Literal["depthwise", "pointwise", "fullyConnected"]
@@ -47,6 +65,10 @@ for idx, row in df.iterrows():
             layerType = "fullyConnected"
         layerList[idx] = layerType
         kernelSize[idx] = int(row["K"])
+        if (layerType == "depthwise" and kernelSize[idx] != DEPTHWISE_KERNEL_SIZE):
+            raise Exception(
+                f"ERROR! Depthwise layer {idx} has unsupported "
+                f"{kernelSize[idx]}x{kernelSize[idx]} kernel; only 3x3 is supported")
         stride[idx] = int(row["Stride"])
         channelsIn[idx] = int(row["In"])
         channelsOut[idx] = int(row["Out"])
@@ -56,16 +78,40 @@ for idx, row in df.iterrows():
             squeezeExcite[idx] = 1
             SEhiddenLayer[idx] = int(row["SE Hidden Layer"])
             SEMACsPerDSP[idx] = int(row["SE Squeeze MACs / DSP"])
-            SEDSPsNeeded[idx] = int(row["Squeeze DSPs Needed"])
-        else:
-            squeezeExcite[idx] = 0
+            SEExciteMACsPerDSP[idx] = int(row["Output SE MACs/DSP"])
+            SEExciteOutputChannelDivisor[idx] = int(row["Excite Operation Output Channel Dividor"])
+            if (SEMACsPerDSP[idx] <= 0 or SEExciteMACsPerDSP[idx] <= 0):
+                raise Exception(f"ERROR! SE layer {idx} must use positive MACs per DSP")
+            if (
+                    SEExciteOutputChannelDivisor[idx] <= 0
+                    or SEExciteOutputChannelDivisor[idx] > channelsOut[idx]):
+                raise Exception(f"ERROR! SE layer {idx} has an invalid excite output-channel divisor")
+
+        if(row["Layer Type"] == "pointwise"):
+            # Spreadsheet formulas can produce a fraction once an entire quarter
+            # already fits in the DSP array. Such a quarter is not subdivided.
+            pointwiseQuarterDivision[idx] = max(
+                1,
+                int(row["Pointwise Divisions Per Quarter"])
+            )
+            pointwiseSRAMScheme[idx] = row["SRAM Loading Scheme"]
+
         SRAMStartIndex[idx] = int(row["SRAM Activation Start Index"])
 
+for fullyConnectedStage in range(2):
+    fullyConnectedOutputLength = (
+        FULLY_CONNECTED_HIDDEN
+        if fullyConnectedStage == 0
+        else FULLY_CONNECTED_OUTPUT)
+    if (fullyConnectedInputDivisor[fullyConnectedStage] <= 0
+            or fullyConnectedInputDivisor[fullyConnectedStage] > fullyConnectedOutputLength):
+        raise Exception(f"ERROR! Fully connected stage {fullyConnectedStage} has an invalid output divisor")
+    if (fullyConnectedMACsPerDSP[fullyConnectedStage] <= 0):
+        raise Exception(f"ERROR! Fully connected stage {fullyConnectedStage} must use positive MACs per DSP")
 
-KERNEL_WEIGHT_CAP = 9
-DEPTHWISE_KERNEL_PARTS = KERNEL_WEIGHT_CAP
-POINTWISE_KERNEL_PARTS = KERNEL_WEIGHT_CAP
-SE_VECTOR_CHUNK_PARTS = 9
+DSP_CHUNK_SIZE = 8
+POINTWISE_VALUES_PER_DSP = 2
+DEPTHWISE_KERNEL_PARTS = DEPTHWISE_KERNEL_SIZE ** 2
 
 def makeJSONSerializable(value):
     if (value is None):
@@ -96,6 +142,8 @@ class DepthwiseKernel:
     type: Literal["depthwise"] = field(default="depthwise", init=False)
     layer: int = -1
     channel: int = -1
+    kernelParts: tuple[int, ...] = field(default_factory=lambda: tuple(range(DEPTHWISE_KERNEL_PARTS)))
+    valuesStored: int = DEPTHWISE_KERNEL_PARTS
 
 @dataclass
 class PointwiseWeight:
@@ -107,9 +155,9 @@ class PointwiseWeight:
 @dataclass
 class PointwiseKernel:
     type: Literal["pointwise"] = field(default="pointwise", init=False)
-    layer: int = -1
-    channel: int = -1 # This is the output channel
-    channelGroup: int = -1 # This is the input channel chunk
+    layer: int
+    channel: int # Output channel.
+    inputChannels: tuple[int, ...]
 
 @dataclass
 class SEWeight:
@@ -125,8 +173,8 @@ class SEKernel:
     weights: List[SEWeight] = field(default_factory=list)
 
     def __post_init__(self):
-        if (len(self.weights) > KERNEL_WEIGHT_CAP):
-            raise Exception(f"ERROR! SE kernel cannot contain more than {KERNEL_WEIGHT_CAP} weights")
+        if (len(self.weights) > DSP_CHUNK_SIZE):
+            raise Exception(f"ERROR! SE kernel cannot contain more than {DSP_CHUNK_SIZE} weights")
 
 @dataclass
 class FullyConnectedWeight:
@@ -165,7 +213,9 @@ class ActivationChunk:
     x: int = -1
     y: int = -1
     channel: int = -1
-    channelChunk: int = -1   # For pointwise it represents the lowest channel.
+    kernelParts: tuple[int, ...] = field(default_factory=tuple)
+    valuesStored: int = 0
+    inputChannels: tuple[int, ...] = field(default_factory=tuple)
 
 @dataclass
 class SEVectorIndex:
@@ -178,7 +228,7 @@ class SEVectorIndex:
 class SEVectorChunk:
     type: SEVectorType
     layer: int = -1
-    channel: int = -1   # represents the lowest channel of the group of 9
+    channel: int = -1   # First channel in this vector chunk.
     valuesStored: int = 0
 
 @dataclass
@@ -195,7 +245,6 @@ class PartialActivation:
     layers: List[int]
     x: int
     y: int
-    segment: int
     outputChannel: int
 
 @dataclass
@@ -210,13 +259,30 @@ class Layer:
 # layer -- means we go from the input channel of layer X to output channel of layer X
 @dataclass
 class DepthwiseConvOperation:
-    type: Literal["depthwise"]
+    type: Literal["depthwise"] = field(default="depthwise", init=False)
     layer: int
     tag: int
+    supervisorTag: int
     stride: int
-    size: int
-    flexBuffer: int
+    quarter: int
+    channel: int
+    numDSPGroups: int
     step: int = 0
+    batchStartPixel: int = 0
+    nextDSPToLoad: int = 0
+    nextOutputToStore: int = 0
+    bufferedKernel: Optional[DepthwiseKernel] = None # This is dumb bro. DepthwiseConvOperation should not have "BufferedKernel"
+    kernelDistributedForBatch: bool = False
+
+@dataclass
+class DepthwiseSupervisorOperation:
+    type: Literal["depthwiseSupervisor"] = field(default="depthwiseSupervisor", init=False)
+    layer: int
+    tag: int
+    quarter: int
+    nextChannel: int = 0
+    childrenInFlight: int = 0
+    childrenCompleted: int = 0
 
 @dataclass
 class CameraDepthwiseConvOperation:
@@ -230,14 +296,36 @@ class CameraDepthwiseConvOperation:
     activationsLoaded: bool = False
 
 @dataclass
+class PointwiseGroupState:
+    channelsCompleted: int = 0
+    channelsInFlight: int = 0
+    outputStored: bool = False
+
+@dataclass
 class PointwiseConvOperation:
-    type: Literal["pointwise"]
+    type: Literal["pointwise"] = field(default="pointwise", init=False)
     layer: int
     tag: int
-    segment: int
+    supervisorTag: int
+    quarter: int
+    quarterSegment: int
     outputChannel: int
-    step: int = 0
-    channelsCompleted: int = 0
+    groupStates: List[PointwiseGroupState]
+    pixels: Optional[tuple[tuple[int, int], ...]] = None
+
+@dataclass
+class PointwiseSupervisorOperation:
+    type: Literal["pointwiseSupervisor"] = field(default="pointwiseSupervisor", init=False)
+    layer: int
+    tag: int
+    quarter: int
+    completedQuarters: tuple[int, ...] = ()
+    pendingQuarters: tuple[int, ...] = ()
+    pixelSegments: tuple[tuple[tuple[int, int], ...], ...] = ()
+    quarterSegment: int = 0
+    nextOutputChannel: int = 0
+    childrenInFlight: int = 0
+    childrenCompleted: int = 0
 
 @dataclass
 class SEVectorProdOperation:
@@ -256,20 +344,29 @@ class SEVectorProdOperation:
     currentOutputStoreIndex: int = 0
     accumulatorRowsLinked: bool = False
     extractedOutputs: List[Union[SEhiddenLayerElem, SEVectorIndex]] = field(default_factory=list)
+    exciteBatchIndex: int = 0
 
 @dataclass
 class FullyConnectedOperation:
-    type: Literal["fullyConnected"]
-    layer: int
+    type: Literal["fullyConnected"] = field(default="fullyConnected", init=False)
     tag: int
-    row: int
-    column: int
-    step: int = 0
+    stage: int = 0
+    batchIndex: int = 0
+    batchStarted: bool = False
+    batchTag: Optional[int] = None
+    weightsLoaded: int = 0
+    DSPindexStart: int = 0
+    currentUnloadingIndex: int = 0
+    currentOutputStoreIndex: int = 0
+    accumulatorRowsLinked: bool = False
+    extractedOutputs: List[SEVectorIndex] = field(default_factory=list)
 
 Operation = Union[
     DepthwiseConvOperation,
+    DepthwiseSupervisorOperation,
     CameraDepthwiseConvOperation,
     PointwiseConvOperation,
+    PointwiseSupervisorOperation,
     SEVectorProdOperation,
     FullyConnectedOperation,
 ]
@@ -442,6 +539,7 @@ class flexBuffer:
 
 PIXEL_HISTORY_MAP_DEPTH = 3
 PIXEL_HISTORY_MAP_SIZE = 64
+SEGMENTS_PER_LAYER = 4
 # This tracks the OUTPUT of each respective layer. Not the INPUT.
 class pixelHistorian:
     
@@ -451,6 +549,7 @@ class pixelHistorian:
         self.depth = depth
         self.pixelHistoryMap = np.zeros((width, height, depth), dtype=bool)
         self.SEVectorCalculated = np.zeros(depth, dtype=bool)
+        self.completedSEVectorLayers = set()
         self.layerForSlot = np.arange(depth, dtype=int)
         self.lastCompletedLayer = -1
         self.layerPointer = 0
@@ -480,6 +579,10 @@ class pixelHistorian:
 
         self.pixelHistoryMap[x, y, layerSlot] = True
 
+        self.advanceCompletedLayers()
+
+    def advanceCompletedLayers(self):
+
         completedLayer = int(self.layerForSlot[self.layerPointer])
         completedSpatialSize = spatialOutput[completedLayer]
         while (self.pixelHistoryMap[:completedSpatialSize, :completedSpatialSize, self.layerPointer].all()):
@@ -495,34 +598,87 @@ class pixelHistorian:
             completedLayer = int(self.layerForSlot[self.layerPointer])
             completedSpatialSize = spatialOutput[completedLayer]
 
-    def isQuarterFinished(self, layer, quarter):
-        layerSlot = self.getLayerSlot(layer)
+    def getQuarterBounds(self, layer, quarter):
         layerSpatialSize = spatialOutput[layer]
         halfSpatialSize = layerSpatialSize // 2
 
         if (quarter == 1):
             xStart = 0
-            xEnd = halfSpatialSize + 1
+            xEnd = halfSpatialSize
             yStart = 0
-            yEnd = halfSpatialSize + 1
+            yEnd = halfSpatialSize
         elif (quarter == 2):
-            xStart = halfSpatialSize - 1
+            xStart = halfSpatialSize
             xEnd = layerSpatialSize
             yStart = 0
-            yEnd = halfSpatialSize + 1
+            yEnd = halfSpatialSize
         elif (quarter == 3):
             xStart = 0
-            xEnd = halfSpatialSize + 1
-            yStart = halfSpatialSize - 1
+            xEnd = halfSpatialSize
+            yStart = halfSpatialSize
             yEnd = layerSpatialSize
         elif (quarter == 4):
-            xStart = halfSpatialSize - 1
+            xStart = halfSpatialSize
             xEnd = layerSpatialSize
-            yStart = halfSpatialSize - 1
+            yStart = halfSpatialSize
             yEnd = layerSpatialSize
         else:
             raise Exception("ERROR! Quarter must be 1, 2, 3, or 4")
 
+        return (xStart, xEnd, yStart, yEnd)
+
+    def setQuarterFinished(self, layer, quarter):
+        layerSlot = self.getLayerSlot(layer)
+        xStart, xEnd, yStart, yEnd = self.getQuarterCompletionBounds(layer, quarter)
+        self.pixelHistoryMap[xStart:xEnd, yStart:yEnd, layerSlot] = True
+        self.advanceCompletedLayers()
+
+    def isQuarterFinished(self, layer, quarter):
+        if (self.isLayerFinished(layer)):
+            return True
+        layerSlot = self.getLayerSlot(layer)
+        xStart, xEnd, yStart, yEnd = self.getQuarterCompletionBounds(layer, quarter)
+        return bool(self.pixelHistoryMap[xStart:xEnd, yStart:yEnd, layerSlot].all())
+
+    def getQuarterCompletionBounds(self, layer, quarter):
+        xStart, xEnd, yStart, yEnd = self.getQuarterBounds(layer, quarter)
+        if (layerList[layer] == "pointwise"):
+            # A finished pointwise quarter includes the neighboring row,
+            # column, and diagonal corner needed by a 3x3 depthwise kernel.
+            spatialSize = int(spatialOutput[layer])
+            xStart, xEnd = max(0, xStart - 1), min(spatialSize, xEnd + 1)
+            yStart, yEnd = max(0, yStart - 1), min(spatialSize, yEnd + 1)
+        return xStart, xEnd, yStart, yEnd
+
+    def getCompletedQuarters(self, layer):
+        return tuple(
+            quarter for quarter in range(1, SEGMENTS_PER_LAYER + 1)
+            if self.isQuarterFinished(layer, quarter))
+
+    def arePixelsFinished(self, layer, pixels):
+        if (self.isLayerFinished(layer) or not pixels):
+            return True
+        layerSlot = self.getLayerSlot(layer)
+        x, y = zip(*pixels)
+        return bool(self.pixelHistoryMap[list(x), list(y), layerSlot].all())
+
+    def setPixelsFinished(self, layer, pixels):
+        if (self.isLayerFinished(layer) or not pixels):
+            return
+        layerSlot = self.getLayerSlot(layer)
+        x, y = zip(*pixels)
+        self.pixelHistoryMap[list(x), list(y), layerSlot] = True
+        self.advanceCompletedLayers()
+
+    def isRegionFinished(self, layer, xStart, xEnd, yStart, yEnd):
+        if (self.isLayerFinished(layer)):
+            return True
+        layerSpatialSize = spatialOutput[layer]
+        if (
+                xStart < 0 or xStart > xEnd or xEnd > layerSpatialSize
+                or yStart < 0 or yStart > yEnd or yEnd > layerSpatialSize):
+            raise Exception("ERROR! Pixel history region is outside the layer bounds")
+        layerSlot = self.getLayerSlot(layer)
         return bool(self.pixelHistoryMap[xStart:xEnd, yStart:yEnd, layerSlot].all())
 
     def isLayerFinished(self, layer):
@@ -531,12 +687,17 @@ class pixelHistorian:
         return layer <= self.lastCompletedLayer
 
     def setSEVectorCalculated(self, layer, calculated=True):
-        layerSlot = self.getLayerSlot(layer)
-        self.SEVectorCalculated[layerSlot] = calculated
+        if (layer < 0):
+            raise Exception("ERROR! SE vector layer cannot be negative")
+        if (calculated):
+            self.completedSEVectorLayers.add(layer)
+        else:
+            self.completedSEVectorLayers.discard(layer)
 
     def isSEVectorCalculated(self, layer):
-        layerSlot = self.getLayerSlot(layer)
-        return bool(self.SEVectorCalculated[layerSlot])
+        if (layer < 0):
+            raise Exception("ERROR! SE vector layer cannot be negative")
+        return layer in self.completedSEVectorLayers
     
     def getLastCompletedLayer(self):
         return self.lastCompletedLayer
@@ -597,7 +758,7 @@ class camera:
     def getActivation(self, x, y):
         assert (x >= 0 and x < self.width), "ERROR! Activation x coordinate is outside the camera width"
         assert (y >= 0 and y < self.height), "ERROR! Activation y coordinate is outside the camera height"
-
+        
         pixelIndex = self.xyToPixelCounter(x, y)
         assert (self.pixelCounter >= pixelIndex), f"ERROR! Camera has not captured enough pixels for this activation to exist. pixelCounter={self.pixelCounter}, pixelIndex={pixelIndex}"
 
@@ -610,6 +771,9 @@ class DSPAccumulator:
         self.accumulatorID = accumulatorID
         self.DSPunits = []
         self.linkedAccumulators = []
+        self.linkedFromAccumulators = []
+        self.operationTag = None
+        self.operationDSPunits = []
         self.linkedOutputReadyClock = None
         self.accumulatedDSPunits = []
         self.accumulatedChannels = []
@@ -624,7 +788,57 @@ class DSPAccumulator:
         DSPunit.accumulator = self
 
     def isFree(self):
-        return all((not dsp.isActive()) and dsp.getOperationTag() is None for dsp in self.DSPunits)
+        return (
+            self.operationTag is None
+            and len(self.linkedAccumulators) == 0
+            and len(self.linkedFromAccumulators) == 0
+            and not self.isActive()
+            and not self.ownHasOutput()
+        )
+
+    def getOperationTag(self):
+        return self.operationTag
+
+    def getOperationDSPunits(self):
+        return self.operationDSPunits.copy()
+
+    def getLinkedAccumulatorComponent(self):
+        accumulatorComponent = []
+        accumulatorsToVisit = [self]
+        seenAccumulators = set()
+
+        while (len(accumulatorsToVisit) > 0):
+            accumulator = accumulatorsToVisit.pop()
+            if (accumulator in seenAccumulators):
+                continue
+
+            seenAccumulators.add(accumulator)
+            accumulatorComponent.append(accumulator)
+            accumulatorsToVisit.extend(accumulator.linkedAccumulators)
+            accumulatorsToVisit.extend(accumulator.linkedFromAccumulators)
+
+        return accumulatorComponent
+
+    def setOperationTag(self, operationTag, DSPunits=None):
+        if (DSPunits is not None):
+            if (any(DSPunit not in self.DSPunits for DSPunit in DSPunits)):
+                raise Exception("ERROR! Cannot assign an accumulator operation to a DSP from another accumulator")
+
+        accumulatorComponent = self.getLinkedAccumulatorComponent()
+        if (operationTag is not None):
+            for accumulator in accumulatorComponent:
+                if (accumulator.operationTag is not None and accumulator.operationTag != operationTag):
+                    raise Exception("ERROR! Linked DSP accumulators cannot have different operation tags")
+
+        for accumulator in accumulatorComponent:
+            accumulator.operationTag = operationTag
+            if (operationTag is None):
+                accumulator.operationDSPunits.clear()
+
+        if (operationTag is not None and DSPunits is not None):
+            for DSPunit in DSPunits:
+                if (DSPunit not in self.operationDSPunits):
+                    self.operationDSPunits.append(DSPunit)
 
     def isActive(self):
         return any(dsp.isActive() for dsp in self.DSPunits)
@@ -656,8 +870,11 @@ class DSPAccumulator:
             return
         if (self in accumulator.getLinkedAccumulatorChain()):
             raise Exception("ERROR! DSP accumulator links cannot contain cycles")
+        if (self.operationTag != accumulator.operationTag):
+            raise Exception("ERROR! Linked DSP accumulators must have matching operation tags")
 
         self.linkedAccumulators.append(accumulator)
+        accumulator.linkedFromAccumulators.append(self)
         self.linkedOutputReadyClock = None
 
     def unlinkAccumulator(self, accumulator):
@@ -665,6 +882,7 @@ class DSPAccumulator:
             return
 
         self.linkedAccumulators.remove(accumulator)
+        accumulator.linkedFromAccumulators.remove(self)
         self.linkedOutputReadyClock = None
 
     def ownHasOutput(self):
@@ -691,7 +909,11 @@ class DSPAccumulator:
 
     def DSPHasOutputMetadata(self, DSPunit):
         if (isinstance(DSPunit.kernel, SEKernel)):
-            return self.accumulatedType in ("SE", "SEExpansion") and DSPunit in self.accumulatedDSPunits
+            return self.accumulatedType in (
+                "SE",
+                "SEExpansion",
+                "FullyConnectedHidden",
+                "FullyConnectedOutput") and DSPunit in self.accumulatedDSPunits
         return (
             DSPunit.kernel.layer >= 0 and
             DSPunit.activationChunk.layer >= 0 and
@@ -759,7 +981,7 @@ class DSPAccumulator:
             self.accumulatedDSPunits.append(DSPunit)
 
         if(DSPunit.kernel.type == "pointwise"):
-            self.accumulatedChannels.append(DSPunit.kernel.channelGroup)
+            self.accumulatedChannels.extend(DSPunit.kernel.inputChannels)
 
     def recordSEDotProductStart(self, DSPunit, layer, row, isExpansion=False):
         if (DSPunit not in self.DSPunits):
@@ -784,6 +1006,38 @@ class DSPAccumulator:
                 self.accumulatedY) = dspMetadata
         elif (accumulatedMetadata != dspMetadata):
             raise Exception("ERROR! DSP accumulator received mismatched SE output metadata")
+
+        if (DSPunit not in self.accumulatedDSPunits):
+            self.accumulatedDSPunits.append(DSPunit)
+
+    def recordFullyConnectedDotProductStart(self, DSPunit, layer, row, isOutputLayer=False):
+        if (DSPunit not in self.DSPunits):
+            raise Exception("ERROR! DSP attempted to record fully connected output with the wrong accumulator")
+        if (not isinstance(DSPunit.kernel, SEKernel)):
+            raise Exception("ERROR! Fully connected accumulator requires a matrix-multiply kernel")
+
+        accumulatedMetadata = (
+            self.accumulatedType,
+            self.accumulatedLayer,
+            self.accumulatedOutputChannel,
+            self.accumulatedX,
+            self.accumulatedY)
+        dspMetadata = (
+            "FullyConnectedOutput" if isOutputLayer else "FullyConnectedHidden",
+            layer,
+            row,
+            -1,
+            -1)
+
+        if (self.accumulatedType is None):
+            (
+                self.accumulatedType,
+                self.accumulatedLayer,
+                self.accumulatedOutputChannel,
+                self.accumulatedX,
+                self.accumulatedY) = dspMetadata
+        elif (accumulatedMetadata != dspMetadata):
+            raise Exception("ERROR! DSP accumulator received mismatched fully connected output metadata")
 
         if (DSPunit not in self.accumulatedDSPunits):
             self.accumulatedDSPunits.append(DSPunit)
@@ -822,6 +1076,11 @@ class DSPAccumulator:
                 type="output",
                 layer=self.accumulatedLayer,
                 channel=self.accumulatedOutputChannel)
+        elif (self.accumulatedType in ("FullyConnectedHidden", "FullyConnectedOutput")):
+            toReturn = SEVectorIndex(
+                type="input" if self.accumulatedType == "FullyConnectedHidden" else "output",
+                layer=self.accumulatedLayer,
+                channel=self.accumulatedOutputChannel)
         elif (self.accumulatedType == "depthwise"):
             toReturn = Activation(
                 type="depthwise",
@@ -833,7 +1092,7 @@ class DSPAccumulator:
             accumulatedChannelSet = set()
             for accumulator in accumulatorsToRead:
                 accumulatedChannelSet.update(accumulator.accumulatedChannels)
-            usedAllChannels = len(accumulatedChannelSet) == channelsIn[self.accumulatedLayer]
+            usedAllChannels = accumulatedChannelSet == set(range(channelsIn[self.accumulatedLayer]))
 
             if (usedAllChannels):
                 toReturn = Activation(
@@ -844,10 +1103,10 @@ class DSPAccumulator:
                     channel=self.accumulatedOutputChannel)
             else:
                 toReturn = PartialActivation(
+                    type="pointwise",
                     layers=[self.accumulatedLayer],
                     x=self.accumulatedX // outputStride,
                     y=self.accumulatedY // outputStride,
-                    segment=min(accumulatedChannelSet),
                     outputChannel=self.accumulatedOutputChannel)
 
         return toReturn
@@ -888,9 +1147,6 @@ class DSPunit:
         self.lastTimerUpdateClockCycle = clkCycles
         
         self.accumulator = None
-        
-        # Operation tag -- used for the DSPmanager to mark which operations correspond to which DSPunits
-        self.operationTag = None
         
     def preloadKernel(self, kernel: Kernel):
         if (isinstance(kernel, SEKernel)):
@@ -958,7 +1214,7 @@ class DSPunit:
         if (self.preAdder.layer != self.activationChunk.layer):
             raise Exception("ERROR! Squeeze-excite DSP pre-adder layer does not match activation chunk layer")
 
-        expectedChannel = (self.activationChunk.channel // SE_VECTOR_CHUNK_PARTS) * SE_VECTOR_CHUNK_PARTS
+        expectedChannel = (self.activationChunk.channel // DSP_CHUNK_SIZE) * DSP_CHUNK_SIZE
         if (self.preAdder.channel != expectedChannel):
             raise Exception("ERROR! Squeeze-excite DSP pre-adder channel does not match activation chunk channel")
         
@@ -968,12 +1224,14 @@ class DSPunit:
                 raise Exception("ERROR! SE dot product started without a loaded SE vector chunk")
             if (len(self.kernel.weights) != self.preAdder.valuesStored):
                 raise Exception("ERROR! SE dot product weight count does not match SE vector chunk count")
-            self.timer = 8
+            self.timer = self.preAdder.valuesStored
             self.lastTimerUpdateClockCycle = clkCycles
             return
 
         if (isinstance(self.kernel, PointwiseKernel)):
-            expectedActivationChannel = self.kernel.channelGroup * POINTWISE_KERNEL_PARTS
+            if (not self.kernel.inputChannels):
+                raise Exception("ERROR! Pointwise DSP started without any input channels")
+            expectedActivationChannel = self.kernel.inputChannels[0]
         else:
             expectedActivationChannel = self.kernel.channel
 
@@ -986,8 +1244,22 @@ class DSPunit:
                 print(f"Mismatched type! Activation type: {self.activationChunk.type}, kernel type: {self.kernel.type}\n")
             raise Exception("ERROR! DSP slice started with mismatched weight and activation")
         else:
-            self.validatePreAdderForActivation()
-            self.timer = 8
+            if (isinstance(self.kernel, DepthwiseKernel)):
+                if (self.activationChunk.valuesStored <= 0):
+                    raise Exception("ERROR! Depthwise DSP started without any activation values")
+                if (self.kernel.valuesStored != self.activationChunk.valuesStored):
+                    raise Exception("ERROR! Depthwise kernel and activation chunk sizes do not match")
+                if (self.kernel.kernelParts != self.activationChunk.kernelParts):
+                    raise Exception("ERROR! Depthwise kernel and activation chunk positions do not match")
+                self.timer = self.activationChunk.valuesStored
+            else:
+                if (self.kernel.inputChannels != self.activationChunk.inputChannels):
+                    raise Exception("ERROR! Pointwise kernel and activation input channels do not match")
+                if (not 0 < self.activationChunk.valuesStored <= DSP_CHUNK_SIZE
+                        or self.activationChunk.valuesStored != len(self.kernel.inputChannels)):
+                    raise Exception("ERROR! Pointwise kernel and activation chunk sizes do not match")
+                self.validatePreAdderForActivation()
+                self.timer = self.activationChunk.valuesStored
             self.lastTimerUpdateClockCycle = clkCycles
             
             if (self.accumulator is None):
@@ -1019,7 +1291,9 @@ class DSPunit:
             elapsedClockCycles = max(0, clkCycles - self.lastTimerUpdateClockCycle)
             self.timer = max(0, self.timer - elapsedClockCycles)
             self.lastTimerUpdateClockCycle = clkCycles
-            if (self.timer == 0):
+            # Pointwise handoff is coordinated across the accumulator's DSPs
+            # by DSPmanager, after the entire next batch has been preloaded.
+            if (self.timer == 0 and not isinstance(self.kernel, PointwiseKernel)):
                 self.startPreloadedDotProductIfAvailable()
     
     def isActive(self):
@@ -1030,10 +1304,15 @@ class DSPunit:
         raise Exception("ERROR! DSP output must be read from its assigned accumulator")
     
     def setOperationTag(self, operationTag):
-        self.operationTag = operationTag
+        if (self.accumulator is None):
+            raise Exception("ERROR! Cannot tag a DSP unit without an accumulator")
+        DSPunits = None if operationTag is None else [self]
+        self.accumulator.setOperationTag(operationTag, DSPunits)
     
     def getOperationTag(self):
-        return self.operationTag
+        if (self.accumulator is None):
+            return None
+        return self.accumulator.getOperationTag()
     
     def getID(self):
         return self.dspID
@@ -1044,6 +1323,7 @@ class DSPunit:
 NUM_DSPS = 292
 CAMERA_DWC_K = 3
 DSPS_PER_ACCUMULATOR = 4
+DSP_OPERATION_FIFO_CAPACITY = 50
 class DSPmanager:
     def __init__(self):
         self.DSPlist = []
@@ -1062,6 +1342,7 @@ class DSPmanager:
             self.DSPlist.append(newDSP)
         
         self.operationFIFO = deque()
+        self.fullyConnectedComplete = False
         
         self.tagCounter = 0
         self.DSPActivationFirstClock = None
@@ -1071,43 +1352,48 @@ class DSPmanager:
         self.DSPOpenRunStarts = [None] * NUM_DSPS
     
     def getFreeDSPunits(self, max=None):
-        freeDSPs = [dsp for dsp in self.DSPlist if (not dsp.isActive() and dsp.getOperationTag() is None)]
+        if (max is not None and max < 0):
+            raise Exception("ERROR! Maximum number of free DSP units cannot be negative")
+
+        freeDSPs = [
+            DSPunit
+            for accumulator in self.getFreeDSPaccumulators()
+            for DSPunit in accumulator.DSPunits
+        ]
         if (max is None):
             return freeDSPs
-        if (max < 0):
-            raise Exception("ERROR! Maximum number of free DSP units cannot be negative")
         return freeDSPs[:max]
+
+    def getFreeDSPaccumulators(self, max=None):
+        if (max is not None and max < 0):
+            raise Exception("ERROR! Maximum number of free DSP accumulators cannot be negative")
+
+        freeAccumulators = [
+            accumulator
+            for accumulator in self.accumulators
+            if accumulator.isFree()
+        ]
+        if (max is None):
+            return freeAccumulators
+        return freeAccumulators[:max]
 
     def getFreeDSPsFromDistinctAccumulators(self, max=None):
         if (max is not None and max < 0):
             raise Exception("ERROR! Maximum number of free DSP units cannot be negative")
 
-        freeDSPs = []
-        for accumulator in self.accumulators:
-            if (not accumulator.isFree()):
-                continue
-            for dsp in accumulator.DSPunits:
-                freeDSPs.append(dsp)
-                break
-
-            if (max is not None and len(freeDSPs) >= max):
-                break
-
-        return freeDSPs
+        return [
+            accumulator.DSPunits[0]
+            for accumulator in self.getFreeDSPaccumulators(max)
+        ]
 
     def getFreeAccumulatorDSPGroups(self, max=None):
         if (max is not None and max < 0):
             raise Exception("ERROR! Maximum number of free DSP accumulator groups cannot be negative")
 
-        freeDSPGroups = []
-        for accumulator in self.accumulators:
-            if (not accumulator.isFree()):
-                continue
-            freeDSPGroups.append(accumulator.DSPunits)
-            if (max is not None and len(freeDSPGroups) >= max):
-                break
-
-        return freeDSPGroups
+        return [
+            accumulator.DSPunits
+            for accumulator in self.getFreeDSPaccumulators(max)
+        ]
 
     def linkAccumulator(self, finalAccumulator, linkedAccumulator):
         finalAccumulator.linkAccumulator(linkedAccumulator)
@@ -1115,14 +1401,36 @@ class DSPmanager:
     def unlinkAccumulator(self, finalAccumulator, linkedAccumulator):
         finalAccumulator.unlinkAccumulator(linkedAccumulator)
 
+    def getSEExciteBatchBounds(self, operation: SEVectorProdOperation):
+        if (operation.exciteBatchIndex < 0):
+            raise Exception("ERROR! SE excite batch index cannot be negative")
+
+        outputChannelCount = channelsOut[operation.layer]
+        batchCount = SEExciteOutputChannelDivisor[operation.layer]
+        if (batchCount <= 0 or batchCount > outputChannelCount):
+            raise Exception("ERROR! SE excite output-channel divisor is invalid")
+        if (operation.exciteBatchIndex >= batchCount):
+            raise Exception("ERROR! SE excite batch index exceeds the configured divisor")
+
+        channelsPerBatch, largerBatchCount = divmod(outputChannelCount, batchCount)
+        batchStart = (
+            operation.exciteBatchIndex * channelsPerBatch
+            + min(operation.exciteBatchIndex, largerBatchCount))
+        batchLength = channelsPerBatch + int(operation.exciteBatchIndex < largerBatchCount)
+        return batchStart, batchStart + batchLength
+
+    def getSEOperationOutputChannelBounds(self, operation: SEVectorProdOperation):
+        if (operation.isExpansion):
+            return self.getSEExciteBatchBounds(operation)
+        return 0, SEhiddenLayer[operation.layer]
+
     def getSEAccumulatorRows(self, operation: SEVectorProdOperation, DSPunits):
         DSPsPerRow = self.getSEDSPsPerRow(
             operation.layer,
             operation.weightsPerDSP,
             operation.isExpansion)
-        outputVectorLength = self.getSEOutputVectorLength(
-            operation.layer,
-            operation.isExpansion)
+        outputChannelStart, outputChannelEnd = self.getSEOperationOutputChannelBounds(operation)
+        outputVectorLength = outputChannelEnd - outputChannelStart
 
         return [
             DSPunits[rowStart:rowStart + DSPsPerRow]
@@ -1161,7 +1469,8 @@ class DSPmanager:
             operation.layer,
             operation.weightsPerDSP,
             operation.isExpansion)
-        row = dspIndex // DSPsPerRow
+        outputChannelStart, _ = self.getSEOperationOutputChannelBounds(operation)
+        row = outputChannelStart + (dspIndex // DSPsPerRow)
         DSPunit.accumulator.recordSEDotProductStart(
             DSPunit,
             operation.layer,
@@ -1213,8 +1522,10 @@ class DSPmanager:
         inputVectorLength = self.getSEInputVectorLength(layer, isExpansion)
         return math.ceil(inputVectorLength / weightsPerDSP)
 
-    def getSEDSPsNeededForMatrix(self, layer, weightsPerDSP, isExpansion=False):
-        return self.getSEDSPsPerRow(layer, weightsPerDSP, isExpansion) * self.getSEOutputVectorLength(layer, isExpansion)
+    def getSEDSPsNeededForMatrix(self, layer, weightsPerDSP, isExpansion=False, outputVectorLength=None):
+        if (outputVectorLength is None):
+            outputVectorLength = self.getSEOutputVectorLength(layer, isExpansion)
+        return self.getSEDSPsPerRow(layer, weightsPerDSP, isExpansion) * outputVectorLength
 
     def getSEDSPSpanForRows(self, layer, weightsPerDSP, isExpansion=False):
         DSPsPerRow = self.getSEDSPsPerRow(layer, weightsPerDSP, isExpansion)
@@ -1240,9 +1551,15 @@ class DSPmanager:
 
         return nextDSPIndex
 
-    def getFreeDSPsForSERows(self, layer, weightsPerDSP, isExpansion=False):
+    def getFreeDSPsForSERows(self, layer, weightsPerDSP, isExpansion=False, outputVectorLength=None):
         DSPsPerRow = self.getSEDSPsPerRow(layer, weightsPerDSP, isExpansion)
-        outputVectorLength = self.getSEOutputVectorLength(layer, isExpansion)
+        if (outputVectorLength is None):
+            outputVectorLength = self.getSEOutputVectorLength(layer, isExpansion)
+        return self.getFreeDSPsForMatrixRows(DSPsPerRow, outputVectorLength)
+
+    def getFreeDSPsForMatrixRows(self, DSPsPerRow, outputVectorLength):
+        if (DSPsPerRow <= 0 or outputVectorLength <= 0):
+            raise Exception("ERROR! Matrix row dimensions must be positive")
         freeDSPs = []
         nextDSPIndex = 0
 
@@ -1278,13 +1595,28 @@ class DSPmanager:
                 return dsp
     
     def assignOperationTag(self, DSPunits, operationTag):
-        for dsp in DSPunits:
-            dsp.setOperationTag(operationTag)
+        DSPunitsByAccumulator = {}
+        for DSPunit in DSPunits:
+            if (DSPunit.accumulator is None):
+                raise Exception("ERROR! Cannot tag a DSP unit without an accumulator")
+            DSPunitsByAccumulator.setdefault(DSPunit.accumulator, []).append(DSPunit)
+
+        for accumulator, accumulatorDSPunits in DSPunitsByAccumulator.items():
+            accumulator.setOperationTag(operationTag, accumulatorDSPunits)
 
     def getDSPsWithOpTag(self, operationTag):
-        return [dsp for dsp in self.DSPlist if dsp.getOperationTag() == operationTag]
+        operationDSPunits = set()
+        for accumulator in self.accumulators:
+            if (accumulator.getOperationTag() == operationTag):
+                operationDSPunits.update(accumulator.getOperationDSPunits())
+
+        return [DSPunit for DSPunit in self.DSPlist if DSPunit in operationDSPunits]
     
     def fifoPush(self, operation: Operation):
+        if (len(self.operationFIFO) >= DSP_OPERATION_FIFO_CAPACITY):
+            raise Exception(
+                f"ERROR! DSP operation FIFO cannot exceed "
+                f"{DSP_OPERATION_FIFO_CAPACITY} entries")
         self.operationFIFO.appendleft(operation)
     
     def fifoPop(self) -> Operation:
@@ -1305,6 +1637,25 @@ class DSPmanager:
 
     def isSEVectorCalculating(self):
         return any(isinstance(operation, SEVectorProdOperation) for operation in self.operationFIFO)
+
+    def isFullyConnectedCalculating(self):
+        return any(isinstance(operation, FullyConnectedOperation) for operation in self.operationFIFO)
+
+    def pwConvEnq(self, layer, quarter):
+        return any(
+            isinstance(operation, PointwiseSupervisorOperation)
+            and operation.layer == layer
+            and operation.quarter == quarter
+            for operation in self.operationFIFO
+        )
+
+    def dwConvEnq(self, layer, quarter):
+        return any(
+            isinstance(operation, DepthwiseSupervisorOperation)
+            and operation.layer == layer
+            and operation.quarter == quarter
+            for operation in self.operationFIFO
+        )
 
     def processSESqueezeOperation(self, operation: SEVectorProdOperation):
         DSPunits = self.getDSPsWithOpTag(operation.tag)
@@ -1365,13 +1716,13 @@ class DSPmanager:
             if ((not operation.isExpansion) and hasSEPreAdderLoaded and hasSEPreAdderPreloaded):
                 return False
 
-            maxWeightsToLoad = KERNEL_WEIGHT_CAP * 2
+            maxWeightsToLoad = DSP_CHUNK_SIZE * 2
             if (hasSEKernelLoaded):
-                maxWeightsToLoad = KERNEL_WEIGHT_CAP
+                maxWeightsToLoad = DSP_CHUNK_SIZE
 
             maxActivationsToLoad = maxWeightsToLoad
             if (not operation.isExpansion and hasSEPreAdderLoaded):
-                maxActivationsToLoad = SE_VECTOR_CHUNK_PARTS
+                maxActivationsToLoad = DSP_CHUNK_SIZE
 
             weightsToLoad = min(remainingWeightsPerDSP, maxWeightsToLoad, maxActivationsToLoad)
             SEKernels = memory.getSEWeightChunksForDSP(
@@ -1421,27 +1772,35 @@ class DSPmanager:
         return self.extractSEVectorOutputs(operation, DSPunits)
 
     def startSEExciteOperation(self, operation: SEVectorProdOperation):
-        squeezeDSPunits = self.getDSPsWithOpTag(operation.tag)
-        for DSPunit in squeezeDSPunits:
-            DSPunit.setOperationTag(None)
+        if (not operation.isExpansion):
+            squeezeDSPunits = self.getDSPsWithOpTag(operation.tag)
+            for DSPunit in squeezeDSPunits:
+                DSPunit.setOperationTag(None)
 
-        operation.isExpansion = True
-        operation.weightsLoaded = 0
-        operation.DSPindexStart = 0
-        operation.currentLoadingIndex = 0
-        operation.currentUnloadingIndex = 0
-        operation.currentOutputStoreIndex = 0
-        operation.accumulatorRowsLinked = False
-        operation.extractedOutputs.clear()
+            operation.isExpansion = True
+            operation.weightsPerDSP = SEExciteMACsPerDSP[operation.layer]
+            operation.exciteBatchIndex = 0
+            operation.weightsLoaded = 0
+            operation.DSPindexStart = 0
+            operation.currentLoadingIndex = 0
+            operation.currentUnloadingIndex = 0
+            operation.currentOutputStoreIndex = 0
+            operation.accumulatorRowsLinked = False
+            operation.extractedOutputs.clear()
+
+        outputChannelStart, outputChannelEnd = self.getSEExciteBatchBounds(operation)
+        batchOutputChannelCount = outputChannelEnd - outputChannelStart
 
         freeDSPs = self.getFreeDSPsForSERows(
             operation.layer,
             operation.weightsPerDSP,
-            True)
+            True,
+            batchOutputChannelCount)
         expectedDSPCount = self.getSEDSPsNeededForMatrix(
             operation.layer,
             operation.weightsPerDSP,
-            True)
+            True,
+            batchOutputChannelCount)
         if (len(freeDSPs) != expectedDSPCount):
             return False
 
@@ -1450,6 +1809,28 @@ class DSPmanager:
         self.tagCounter += 1
         operation.exciteOperationStarted = True
         return True
+
+    def completeSEExciteBatch(self, operation: SEVectorProdOperation):
+        if (operation.exciteTag is not None):
+            for DSPunit in self.getDSPsWithOpTag(operation.exciteTag):
+                DSPunit.setOperationTag(None)
+
+        operation.exciteBatchIndex += 1
+        if (operation.exciteBatchIndex >= SEExciteOutputChannelDivisor[operation.layer]):
+            operation.exciteTag = None
+            operation.exciteOperationStarted = False
+            return True
+
+        operation.exciteTag = None
+        operation.exciteOperationStarted = False
+        operation.weightsLoaded = 0
+        operation.DSPindexStart = 0
+        operation.currentLoadingIndex = 0
+        operation.currentUnloadingIndex = 0
+        operation.currentOutputStoreIndex = 0
+        operation.accumulatorRowsLinked = False
+        operation.extractedOutputs.clear()
+        return False
 
     def processSEExciteOperation(self, operation: SEVectorProdOperation):
         if (not operation.exciteOperationStarted):
@@ -1460,10 +1841,13 @@ class DSPmanager:
             raise Exception("ERROR! SE excite operation started without an excite tag")
 
         DSPunits = self.getDSPsWithOpTag(operation.exciteTag)
+        outputChannelStart, outputChannelEnd = self.getSEExciteBatchBounds(operation)
+        batchOutputChannelCount = outputChannelEnd - outputChannelStart
         expectedDSPCount = self.getSEDSPsNeededForMatrix(
             operation.layer,
             operation.weightsPerDSP,
-            True)
+            True,
+            batchOutputChannelCount)
         if (len(DSPunits) != expectedDSPCount):
             raise Exception("ERROR! SE excite operation must load all DSP units assigned to the operation")
         if (operation.weightsPerDSP < 0):
@@ -1480,8 +1864,13 @@ class DSPmanager:
 
         remainingWeightsPerDSP = operation.weightsPerDSP - operation.weightsLoaded
         if (remainingWeightsPerDSP == 0):
-            return self.extractSEVectorOutputs(operation, DSPunits)
+            if (not self.extractSEVectorOutputs(operation, DSPunits)):
+                return False
+            return self.completeSEExciteBatch(operation)
 
+        weightsLoadedThisPass = None
+        DSPsPerRow = self.getSEDSPsPerRow(operation.layer, operation.weightsPerDSP, True)
+        inputVectorLength = self.getSEInputVectorLength(operation.layer, True)
         for dspIndex in range(operation.DSPindexStart, len(DSPunits)):
             DSPunit = DSPunits[dspIndex]
             DSPunit.isActive()
@@ -1517,22 +1906,43 @@ class DSPmanager:
             if (hasSEPreAdderLoaded and hasSEPreAdderPreloaded):
                 return False
 
-            maxWeightsToLoad = KERNEL_WEIGHT_CAP * 2
+            maxWeightsToLoad = DSP_CHUNK_SIZE * 2
             if (hasSEKernelLoaded):
-                maxWeightsToLoad = KERNEL_WEIGHT_CAP
+                maxWeightsToLoad = DSP_CHUNK_SIZE
 
             maxActivationsToLoad = maxWeightsToLoad
             if (hasSEPreAdderLoaded):
-                maxActivationsToLoad = SE_VECTOR_CHUNK_PARTS
+                maxActivationsToLoad = DSP_CHUNK_SIZE
 
-            weightsToLoad = min(remainingWeightsPerDSP, maxWeightsToLoad, maxActivationsToLoad)
+            if (weightsLoadedThisPass is None):
+                weightsLoadedThisPass = min(
+                    remainingWeightsPerDSP,
+                    maxWeightsToLoad,
+                    maxActivationsToLoad)
+
+            dspIndexInRow = dspIndex % DSPsPerRow
+            dspInputStart = dspIndexInRow * operation.weightsPerDSP
+            weightsForDSP = min(
+                operation.weightsPerDSP,
+                inputVectorLength - dspInputStart)
+            remainingWeightsForDSP = weightsForDSP - operation.weightsLoaded
+            if (remainingWeightsForDSP <= 0):
+                operation.DSPindexStart = dspIndex + 1
+                continue
+
+            weightsToLoad = min(
+                weightsLoadedThisPass,
+                maxWeightsToLoad,
+                maxActivationsToLoad,
+                remainingWeightsForDSP)
             SEKernels = memory.getSEWeightChunksForDSP(
                 operation.layer,
                 True,
                 dspIndex,
                 operation.weightsPerDSP,
                 operation.weightsLoaded,
-                weightsToLoad)
+                weightsToLoad,
+                outputChannelStart)
             if (SEKernels == False):
                 operation.DSPindexStart = dspIndex
                 return False
@@ -1560,15 +1970,301 @@ class DSPmanager:
 
             operation.DSPindexStart = dspIndex + 1
 
-        operation.weightsLoaded += weightsToLoad
+        if (weightsLoadedThisPass is None):
+            raise Exception("ERROR! SE excite operation did not advance its weight load")
+        operation.weightsLoaded += weightsLoadedThisPass
         operation.DSPindexStart = 0
         if (operation.weightsLoaded < operation.weightsPerDSP):
             return False
-        return self.extractSEVectorOutputs(operation, DSPunits)
+        if (not self.extractSEVectorOutputs(operation, DSPunits)):
+            return False
+        return self.completeSEExciteBatch(operation)
     
+    def getFullyConnectedInputLength(self, stage):
+        if (stage == 0):
+            return FULLY_CONNECTED_INPUT
+        if (stage == 1):
+            return FULLY_CONNECTED_HIDDEN
+        raise Exception("ERROR! Fully connected stage must be 0 or 1")
+
+    def getFullyConnectedOutputLength(self, stage):
+        if (stage == 0):
+            return FULLY_CONNECTED_HIDDEN
+        if (stage == 1):
+            return FULLY_CONNECTED_OUTPUT
+        raise Exception("ERROR! Fully connected stage must be 0 or 1")
+
+    def getFullyConnectedLayer(self, stage):
+        if (stage < 0 or stage > 1):
+            raise Exception("ERROR! Fully connected stage must be 0 or 1")
+        return FULLY_CONNECTED_LAYER_START + stage
+
+    def getFullyConnectedBatchBounds(self, operation: FullyConnectedOperation):
+        outputLength = self.getFullyConnectedOutputLength(operation.stage)
+        batchCount = int(fullyConnectedInputDivisor[operation.stage])
+        if (operation.batchIndex < 0 or operation.batchIndex >= batchCount):
+            raise Exception("ERROR! Fully connected batch index is outside the configured divisor")
+
+        outputsPerBatch, largerBatchCount = divmod(outputLength, batchCount)
+        batchStart = (
+            operation.batchIndex * outputsPerBatch
+            + min(operation.batchIndex, largerBatchCount))
+        batchLength = outputsPerBatch + int(operation.batchIndex < largerBatchCount)
+        return batchStart, batchStart + batchLength
+
+    def getFullyConnectedDSPsPerRow(self, operation: FullyConnectedOperation):
+        return math.ceil(
+            self.getFullyConnectedInputLength(operation.stage)
+            / fullyConnectedMACsPerDSP[operation.stage])
+
+    def getFullyConnectedAccumulatorRows(self, operation: FullyConnectedOperation, DSPunits):
+        DSPsPerRow = self.getFullyConnectedDSPsPerRow(operation)
+        outputStart, outputEnd = self.getFullyConnectedBatchBounds(operation)
+        return [
+            DSPunits[rowStart:rowStart + DSPsPerRow]
+            for rowStart in range(0, DSPsPerRow * (outputEnd - outputStart), DSPsPerRow)
+        ]
+
+    def linkFullyConnectedAccumulatorRows(self, operation: FullyConnectedOperation, DSPunits):
+        for rowDSPs in self.getFullyConnectedAccumulatorRows(operation, DSPunits):
+            finalAccumulator = rowDSPs[0].accumulator
+            linkedAccumulators = set()
+            for DSPunit in rowDSPs[1:]:
+                if (DSPunit.accumulator is finalAccumulator or DSPunit.accumulator in linkedAccumulators):
+                    continue
+                finalAccumulator.linkAccumulator(DSPunit.accumulator)
+                linkedAccumulators.add(DSPunit.accumulator)
+        operation.accumulatorRowsLinked = True
+
+    def recordFullyConnectedAccumulatorStart(
+            self,
+            DSPunit,
+            operation: FullyConnectedOperation,
+            dspIndex):
+        DSPsPerRow = self.getFullyConnectedDSPsPerRow(operation)
+        outputStart, _ = self.getFullyConnectedBatchBounds(operation)
+        outputChannel = outputStart + (dspIndex // DSPsPerRow)
+        DSPunit.accumulator.recordFullyConnectedDotProductStart(
+            DSPunit,
+            self.getFullyConnectedLayer(operation.stage),
+            outputChannel,
+            operation.stage == 1)
+
+    def resetFullyConnectedBatchState(self, operation: FullyConnectedOperation):
+        operation.batchStarted = False
+        operation.batchTag = None
+        operation.weightsLoaded = 0
+        operation.DSPindexStart = 0
+        operation.currentUnloadingIndex = 0
+        operation.currentOutputStoreIndex = 0
+        operation.accumulatorRowsLinked = False
+        operation.extractedOutputs.clear()
+
+    def startFullyConnectedBatch(self, operation: FullyConnectedOperation):
+        outputStart, outputEnd = self.getFullyConnectedBatchBounds(operation)
+        DSPsPerRow = self.getFullyConnectedDSPsPerRow(operation)
+        freeDSPs = self.getFreeDSPsForMatrixRows(DSPsPerRow, outputEnd - outputStart)
+        expectedDSPCount = DSPsPerRow * (outputEnd - outputStart)
+        if (len(freeDSPs) != expectedDSPCount):
+            return False
+
+        operation.batchTag = self.tagCounter
+        self.assignOperationTag(freeDSPs, operation.batchTag)
+        self.tagCounter += 1
+        operation.batchStarted = True
+        return True
+
+    def extractFullyConnectedOutputs(self, operation: FullyConnectedOperation, DSPunits):
+        rowDSPsList = self.getFullyConnectedAccumulatorRows(operation, DSPunits)
+        expectedLayer = self.getFullyConnectedLayer(operation.stage)
+
+        while (operation.currentUnloadingIndex < len(rowDSPsList)):
+            rowDSPs = rowDSPsList[operation.currentUnloadingIndex]
+            finalAccumulator = rowDSPs[0].accumulator
+            if (not finalAccumulator.hasOutputReady()):
+                break
+
+            output = finalAccumulator.getOutput()
+            expectedType = "input" if operation.stage == 0 else "output"
+            if (
+                    not isinstance(output, SEVectorIndex)
+                    or output.type != expectedType
+                    or output.layer != expectedLayer):
+                raise Exception("ERROR! Fully connected accumulator produced the wrong output")
+            operation.extractedOutputs.append(output)
+            finalAccumulator.clearOutput()
+            self.unlinkSEAccumulatorRow(rowDSPs)
+            operation.currentUnloadingIndex += 1
+
+        if (operation.currentUnloadingIndex < len(rowDSPsList)):
+            return False
+
+        while (operation.currentOutputStoreIndex < len(operation.extractedOutputs)):
+            output = operation.extractedOutputs[operation.currentOutputStoreIndex]
+            if (not memory.loadFullyConnectedVectorPart(output)):
+                return False
+            operation.currentOutputStoreIndex += 1
+        return True
+
+    def completeFullyConnectedBatch(self, operation: FullyConnectedOperation):
+        if (operation.batchTag is not None):
+            for DSPunit in self.getDSPsWithOpTag(operation.batchTag):
+                DSPunit.setOperationTag(None)
+
+        operation.batchIndex += 1
+        batchCount = int(fullyConnectedInputDivisor[operation.stage])
+        if (operation.batchIndex < batchCount):
+            self.resetFullyConnectedBatchState(operation)
+            return False
+
+        if (operation.stage == 0):
+            # Every GAP average has now been consumed and the entire hidden
+            # vector has been committed to SRAM for the output stage.
+            memory.clearAccumulator()
+            operation.stage = 1
+            operation.batchIndex = 0
+            self.resetFullyConnectedBatchState(operation)
+            return False
+
+        operation.batchTag = None
+        operation.batchStarted = False
+        return True
+
+    def processFullyConnectedOperation(self, operation: FullyConnectedOperation):
+        if (not operation.batchStarted):
+            if (not self.startFullyConnectedBatch(operation)):
+                return False
+
+        if (operation.batchTag is None):
+            raise Exception("ERROR! Fully connected batch started without an operation tag")
+
+        DSPunits = self.getDSPsWithOpTag(operation.batchTag)
+        outputStart, outputEnd = self.getFullyConnectedBatchBounds(operation)
+        DSPsPerRow = self.getFullyConnectedDSPsPerRow(operation)
+        expectedDSPCount = DSPsPerRow * (outputEnd - outputStart)
+        if (len(DSPunits) != expectedDSPCount):
+            raise Exception("ERROR! Fully connected batch did not reserve its complete DSP matrix")
+
+        weightsPerDSP = int(fullyConnectedMACsPerDSP[operation.stage])
+        if (operation.weightsLoaded < 0 or operation.weightsLoaded > weightsPerDSP):
+            raise Exception("ERROR! Fully connected weight cursor is outside the DSP allocation")
+        if (operation.DSPindexStart < 0 or operation.DSPindexStart > len(DSPunits)):
+            raise Exception("ERROR! Fully connected DSP cursor is outside the allocated matrix")
+
+        if (not operation.accumulatorRowsLinked):
+            self.linkFullyConnectedAccumulatorRows(operation, DSPunits)
+
+        remainingWeightsPerDSP = weightsPerDSP - operation.weightsLoaded
+        if (remainingWeightsPerDSP == 0):
+            if (not self.extractFullyConnectedOutputs(operation, DSPunits)):
+                return False
+            return self.completeFullyConnectedBatch(operation)
+
+        weightsLoadedThisPass = None
+        for dspIndex in range(operation.DSPindexStart, len(DSPunits)):
+            DSPunit = DSPunits[dspIndex]
+            DSPunit.isActive()
+            hasKernelLoaded = isinstance(DSPunit.kernel, SEKernel)
+            hasKernelPreloaded = isinstance(DSPunit.preloadedKernel, SEKernel)
+            hasInputLoaded = isinstance(DSPunit.preAdder, SEVectorChunk) and DSPunit.preAdder.valuesStored > 0
+            hasInputPreloaded = (
+                isinstance(DSPunit.preloadedPreAdder, SEVectorChunk)
+                and DSPunit.preloadedPreAdder.valuesStored > 0)
+
+            if ((not DSPunit.isActive()) and hasKernelLoaded and (not hasKernelPreloaded)):
+                DSPunit.clearActiveStorage()
+                hasKernelLoaded = False
+                hasInputLoaded = False
+
+            if ((not DSPunit.isActive()) and DSPunit.hasPreloadedDotProduct()):
+                DSPunit.startPreloadedDotProductIfAvailable()
+                self.recordFullyConnectedAccumulatorStart(DSPunit, operation, dspIndex)
+                hasKernelLoaded = isinstance(DSPunit.kernel, SEKernel)
+                hasKernelPreloaded = isinstance(DSPunit.preloadedKernel, SEKernel)
+                hasInputLoaded = isinstance(DSPunit.preAdder, SEVectorChunk) and DSPunit.preAdder.valuesStored > 0
+                hasInputPreloaded = (
+                    isinstance(DSPunit.preloadedPreAdder, SEVectorChunk)
+                    and DSPunit.preloadedPreAdder.valuesStored > 0)
+
+            if ((not hasKernelLoaded) and hasKernelPreloaded):
+                DSPunit.loadKernel()
+                hasKernelLoaded = True
+                hasKernelPreloaded = False
+            if ((not hasInputLoaded) and hasInputPreloaded):
+                DSPunit.loadPreAdder()
+                hasInputLoaded = True
+                hasInputPreloaded = False
+
+            if (hasKernelLoaded and hasKernelPreloaded):
+                return False
+            if (hasInputLoaded and hasInputPreloaded):
+                return False
+
+            maxWeightsToLoad = DSP_CHUNK_SIZE * 2
+            if (hasKernelLoaded):
+                maxWeightsToLoad = DSP_CHUNK_SIZE
+            maxInputsToLoad = maxWeightsToLoad
+            if (hasInputLoaded):
+                maxInputsToLoad = DSP_CHUNK_SIZE
+
+            if (weightsLoadedThisPass is None):
+                weightsLoadedThisPass = min(
+                    remainingWeightsPerDSP,
+                    maxWeightsToLoad,
+                    maxInputsToLoad)
+            valuesToLoad = min(weightsLoadedThisPass, maxWeightsToLoad, maxInputsToLoad)
+
+            kernels = memory.getFullyConnectedWeightChunksForDSP(
+                operation.stage,
+                dspIndex,
+                weightsPerDSP,
+                operation.weightsLoaded,
+                valuesToLoad,
+                outputStart)
+            if (kernels == False):
+                operation.DSPindexStart = dspIndex
+                return False
+
+            inputChunks = memory.getFullyConnectedInputChunksForDSP(
+                operation.stage,
+                dspIndex,
+                weightsPerDSP,
+                operation.weightsLoaded,
+                valuesToLoad)
+            if (inputChunks == False):
+                operation.DSPindexStart = dspIndex
+                return False
+
+            if (hasKernelLoaded):
+                DSPunit.preloadKernel(kernels[0])
+                DSPunit.preloadPreAdder(inputChunks[0])
+            else:
+                DSPunit.preloadKernel(kernels[0])
+                DSPunit.preloadPreAdder(inputChunks[0])
+                DSPunit.loadKernel()
+                DSPunit.loadPreAdder()
+                DSPunit.startDotProduct()
+                self.recordFullyConnectedAccumulatorStart(DSPunit, operation, dspIndex)
+                if (len(kernels) > 1):
+                    DSPunit.preloadKernel(kernels[1])
+                    DSPunit.preloadPreAdder(inputChunks[1])
+
+            operation.DSPindexStart = dspIndex + 1
+
+        if (weightsLoadedThisPass is None):
+            raise Exception("ERROR! Fully connected operation did not advance its weight load")
+        operation.weightsLoaded += weightsLoadedThisPass
+        operation.DSPindexStart = 0
+        if (operation.weightsLoaded < weightsPerDSP):
+            return False
+        if (not self.extractFullyConnectedOutputs(operation, DSPunits)):
+            return False
+        return self.completeFullyConnectedBatch(operation)
+
     def startDepthwiseConvFromCamera(self, targetX, targetY, camera: camera):
-        lastNeededX = min(targetX + (kernelSize[0] // 2), camera.width - 1)
-        lastNeededY = min(targetY + (kernelSize[0] // 2), camera.height - 1)
+        kernelRadius = DEPTHWISE_KERNEL_SIZE // 2
+        lastNeededX = min(targetX + kernelRadius, camera.width - 1)
+        lastNeededY = min(targetY + kernelRadius, camera.height - 1)
         lastNeededPixel = camera.xyToPixelCounter(lastNeededX, lastNeededY)
 
         if (camera.pixelNumber() < lastNeededPixel):
@@ -1592,15 +2288,768 @@ class DSPmanager:
         
         return True
 
+    def getPointwiseSegmentPixels(self, layer, quarter, quarterSegment):
+        if (layer < 0 or layer >= layers):
+            raise Exception("ERROR! Pointwise layer is outside the layer range")
+        if (layerList[layer] != "pointwise"):
+            raise Exception("ERROR! Pointwise operation requested for a non-pointwise layer")
+        if (quarter < 1 or quarter > SEGMENTS_PER_LAYER):
+            raise Exception("ERROR! Quarter must be 1, 2, 3, or 4")
+
+        division = int(pointwiseQuarterDivision[layer])
+        if (division <= 0 or (division & (division - 1)) != 0):
+            raise Exception("ERROR! Pointwise quarter division must be a positive power of two")
+        if (quarterSegment < 0 or quarterSegment >= division):
+            raise Exception("ERROR! Pointwise quarter segment is outside the quarter division")
+
+        spatialSize = int(spatialOutput[layer])
+        halfSpatialSize = spatialSize // 2
+        if (spatialSize % 2 != 0):
+            raise Exception("ERROR! Pointwise spatial size must be divisible into four equal quarters")
+
+        quarterColumn = (quarter - 1) % 2
+        quarterRow = (quarter - 1) // 2
+        quarterXStart = quarterColumn * halfSpatialSize
+        quarterYStart = quarterRow * halfSpatialSize
+
+        # Keep power-of-two subdivisions as square as possible. For example,
+        # division 16 becomes a 4x4 row-major grid, matching quarterSegment 0-15.
+        divisionExponent = division.bit_length() - 1
+        segmentColumns = 1 << ((divisionExponent + 1) // 2)
+        segmentRows = division // segmentColumns
+        if (halfSpatialSize % segmentColumns != 0 or halfSpatialSize % segmentRows != 0):
+            raise Exception("ERROR! Pointwise quarter cannot be evenly divided into the requested grid")
+
+        segmentWidth = halfSpatialSize // segmentColumns
+        segmentHeight = halfSpatialSize // segmentRows
+        segmentColumn = quarterSegment % segmentColumns
+        segmentRow = quarterSegment // segmentColumns
+        xStart = quarterXStart + segmentColumn * segmentWidth
+        yStart = quarterYStart + segmentRow * segmentHeight
+
+        return [
+            (x, y)
+            for y in range(yStart, yStart + segmentHeight)
+            for x in range(xStart, xStart + segmentWidth)
+        ]
+
+    def getPointwiseQuarterSegments(self, layer, quarter, coveredQuarters):
+        coveredBounds = [
+            pixelMap.getQuarterCompletionBounds(layer, coveredQuarter)
+            for coveredQuarter in coveredQuarters]
+
+        def needsCompute(x, y):
+            return not any(
+                xStart <= x < xEnd and yStart <= y < yEnd
+                for xStart, xEnd, yStart, yEnd in coveredBounds)
+
+        # Preserve the spreadsheet's core tile order and add the outside border
+        # afterward. Split both into batches that fit the physical DSP array.
+        coreSegments = [
+            self.getPointwiseSegmentPixels(layer, quarter, segment)
+            for segment in range(int(pointwiseQuarterDivision[layer]))]
+        batchCapacity = min(len(coreSegments[0]), len(self.accumulators))
+        xStart, xEnd, yStart, yEnd = pixelMap.getQuarterCompletionBounds(layer, quarter)
+        coreXStart, coreXEnd, coreYStart, coreYEnd = pixelMap.getQuarterBounds(layer, quarter)
+        borderPixels = [
+            (x, y)
+            for y in range(yStart, yEnd)
+            for x in range(xStart, xEnd)
+            if not (coreXStart <= x < coreXEnd and coreYStart <= y < coreYEnd)]
+        segments = []
+        for pixels in coreSegments + [borderPixels]:
+            remainingPixels = [pixel for pixel in pixels if needsCompute(*pixel)]
+            for offset in range(0, len(remainingPixels), batchCapacity):
+                segments.append(tuple(remainingPixels[offset:offset + batchCapacity]))
+        return tuple(segments)
+
+    def getPointwiseSRAMStoreOrder(self, layer, segmentPixels):
+        scheme = str(pointwiseSRAMScheme[layer]).strip()
+        if (scheme == "basic"):
+            return list(range(len(segmentPixels)))
+
+        if (len(segmentPixels) == 0):
+            return []
+
+        minX = min(x for x, _ in segmentPixels)
+        minY = min(y for _, y in segmentPixels)
+
+        if (scheme == "altCol"):
+            return [
+                index
+                for columnParity in range(2)
+                for index, (x, _) in enumerate(segmentPixels)
+                if ((x - minX) % 2 == columnParity)
+            ]
+
+        if (scheme == "altRow"):
+            return [
+                index
+                for rowParity in range(2)
+                for index, (_, y) in enumerate(segmentPixels)
+                if ((y - minY) % 2 == rowParity)
+            ]
+
+        raise Exception(
+            f'ERROR! Unknown pointwise SRAM loading scheme "{scheme}" for layer {layer}')
+
+    def pointwiseKernelMatches(self, kernel, layer, outputChannel, inputChannels):
+        return (
+            isinstance(kernel, PointwiseKernel)
+            and kernel.layer == layer
+            and kernel.channel == outputChannel
+            and kernel.inputChannels == inputChannels)
+
+    def pointwiseActivationMatches(self, activationChunk, layer, x, y, inputChannels):
+        return (
+            isinstance(activationChunk, ActivationChunk)
+            and activationChunk.type == "pointwise"
+            and activationChunk.layer == layer
+            and activationChunk.x == x
+            and activationChunk.y == y
+            and activationChunk.inputChannels == inputChannels
+            and activationChunk.valuesStored == len(inputChannels))
+
+    def getPointwiseSupervisorByTag(self, supervisorTag):
+        matchingSupervisors = [
+            operation
+            for operation in self.operationFIFO
+            if (
+                isinstance(operation, PointwiseSupervisorOperation)
+                and operation.tag == supervisorTag)
+        ]
+        if (len(matchingSupervisors) != 1):
+            raise Exception("ERROR! Pointwise child operation could not find its supervisor")
+        return matchingSupervisors[0]
+
+    def notifyPointwiseChildComplete(self, operation: PointwiseConvOperation):
+        supervisor = self.getPointwiseSupervisorByTag(operation.supervisorTag)
+        if (
+                supervisor.layer != operation.layer
+                or supervisor.quarter != operation.quarter
+                or supervisor.quarterSegment != operation.quarterSegment):
+            raise Exception("ERROR! Pointwise child completion does not match its supervisor")
+        if (supervisor.childrenInFlight <= 0):
+            raise Exception("ERROR! Pointwise supervisor received an unexpected child completion")
+        if (supervisor.childrenCompleted >= supervisor.nextOutputChannel):
+            raise Exception("ERROR! Pointwise supervisor received too many child completions")
+
+        supervisor.childrenInFlight -= 1
+        supervisor.childrenCompleted += 1
+
+    def startPointwiseChildOperation(
+            self,
+            supervisor: PointwiseSupervisorOperation,
+            outputChannel):
+        segmentPixels = supervisor.pixelSegments[supervisor.quarterSegment]
+        # Border inputs may belong to source quarters that are still running.
+        # Wait before reserving DSPs or trying to read their activations.
+        inputPixels = tuple(
+            (x * stride[supervisor.layer], y * stride[supervisor.layer])
+            for x, y in segmentPixels)
+        if (not pixelMap.arePixelsFinished(supervisor.layer - 1, inputPixels)):
+            return False
+        freeDSPGroups = self.getFreeAccumulatorDSPGroups(len(segmentPixels))
+        if (len(freeDSPGroups) != len(segmentPixels)):
+            return False
+
+        freeDSPs = [
+            DSPunit
+            for DSPGroup in freeDSPGroups
+            for DSPunit in DSPGroup
+        ]
+        childTag = self.tagCounter
+        self.assignOperationTag(freeDSPs, childTag)
+        pointwiseConvOp = PointwiseConvOperation(
+            layer=supervisor.layer,
+            tag=childTag,
+            supervisorTag=supervisor.tag,
+            quarter=supervisor.quarter,
+            quarterSegment=supervisor.quarterSegment,
+            outputChannel=outputChannel,
+            groupStates=[PointwiseGroupState() for _ in freeDSPGroups],
+            pixels=segmentPixels)
+        self.tagCounter += 1
+        self.fifoPush(pointwiseConvOp)
+        return True
+
+    def processPointwiseSupervisorOperation(
+            self,
+            operation: PointwiseSupervisorOperation):
+        if (operation.quarterSegment >= len(operation.pixelSegments)):
+            # Work owned by an earlier queued quarter can still be in flight.
+            # Completing our own pixels alone does not guarantee the border.
+            return pixelMap.isQuarterFinished(operation.layer, operation.quarter)
+        if (operation.childrenInFlight < 0 or operation.childrenCompleted < 0):
+            raise Exception("ERROR! Pointwise supervisor child counters cannot be negative")
+        if (operation.nextOutputChannel > channelsOut[operation.layer]):
+            raise Exception("ERROR! Pointwise supervisor issued too many output channels")
+        if (operation.childrenCompleted + operation.childrenInFlight != operation.nextOutputChannel):
+            raise Exception("ERROR! Pointwise supervisor child counters are inconsistent")
+
+        allChildrenIssued = operation.nextOutputChannel == channelsOut[operation.layer]
+        if (allChildrenIssued and operation.childrenInFlight == 0):
+            if (operation.childrenCompleted != channelsOut[operation.layer]):
+                raise Exception("ERROR! Pointwise supervisor completed without all output channels")
+
+            pixelMap.setPixelsFinished(
+                operation.layer, operation.pixelSegments[operation.quarterSegment])
+            operation.quarterSegment += 1
+            if (operation.quarterSegment >= len(operation.pixelSegments)):
+                return pixelMap.isQuarterFinished(operation.layer, operation.quarter)
+
+            operation.nextOutputChannel = 0
+            operation.childrenCompleted = 0
+
+        # Keep issuing children until the next output channel cannot reserve a
+        # complete accumulator group for every pixel in the current segment.
+        while (operation.nextOutputChannel < channelsOut[operation.layer]):
+            if (not self.startPointwiseChildOperation(
+                    operation,
+                    operation.nextOutputChannel)):
+                break
+
+            operation.nextOutputChannel += 1
+            operation.childrenInFlight += 1
+
+        return False
+
+    def preloadPointwiseGroup(
+            self,
+            operation: PointwiseConvOperation,
+            DSPGroup,
+            outputX,
+            outputY,
+            firstChannel,
+            channelsThisBatch):
+        inputX = outputX * stride[operation.layer]
+        inputY = outputY * stride[operation.layer]
+        inputChannelsByDSP = [
+            tuple(range(
+                firstChannel + DSPoffset,
+                firstChannel + channelsThisBatch,
+                DSPS_PER_ACCUMULATOR))
+            for DSPoffset in range(min(channelsThisBatch, DSPS_PER_ACCUMULATOR))
+        ]
+        participatingDSPs = DSPGroup[:len(inputChannelsByDSP)]
+
+        for DSPunit, inputChannels in zip(participatingDSPs, inputChannelsByDSP):
+            if (not self.pointwiseKernelMatches(
+                    DSPunit.preloadedKernel,
+                    operation.layer,
+                    operation.outputChannel,
+                    inputChannels)):
+                desiredKernel = PointwiseKernel(
+                    layer=operation.layer,
+                    channel=operation.outputChannel,
+                    inputChannels=inputChannels)
+                if (not memory.askForKernel(desiredKernel, DSPunit.getID())):
+                    continue
+
+            if (not self.pointwiseActivationMatches(
+                    DSPunit.preloadedActivationChunk,
+                    operation.layer,
+                    inputX,
+                    inputY,
+                    inputChannels)):
+                memory.askForPointwiseActivationChunk(
+                    operation.layer,
+                    inputX,
+                    inputY,
+                    inputChannels,
+                    DSPunit.getID())
+
+        # Only this pixel's four-DSP group must be ready. Other pixels can
+        # continue loading or computing independently.
+        if (not all(
+                self.pointwiseKernelMatches(
+                    DSPunit.preloadedKernel,
+                    operation.layer,
+                    operation.outputChannel,
+                    inputChannels)
+                and self.pointwiseActivationMatches(
+                    DSPunit.preloadedActivationChunk,
+                    operation.layer,
+                    inputX,
+                    inputY,
+                    inputChannels)
+                for DSPunit, inputChannels in zip(participatingDSPs, inputChannelsByDSP))):
+            return False
+
+        return True
+
+    def processPointwiseConvOperation(self, operation: PointwiseConvOperation):
+        DSPunits = self.getDSPsWithOpTag(operation.tag)
+        DSPGroups = [
+            DSPunits[index:index + DSPS_PER_ACCUMULATOR]
+            for index in range(0, len(DSPunits), DSPS_PER_ACCUMULATOR)
+        ]
+        segmentPixels = operation.pixels
+        if (segmentPixels is None):
+            segmentPixels = self.getPointwiseSegmentPixels(
+                operation.layer,
+                operation.quarter,
+                operation.quarterSegment)
+
+        if (
+                len(DSPGroups) != len(segmentPixels)
+                or len(operation.groupStates) != len(DSPGroups)
+                or any(len(DSPGroup) != DSPS_PER_ACCUMULATOR for DSPGroup in DSPGroups)):
+            raise Exception("ERROR! Pointwise operation requires one DSP accumulator group per pixel")
+
+        # Each accumulator has an active batch and one preload batch, each
+        # containing up to eight pairs total (two per DSP). Fill the next
+        # batch while the current batch computes, then hand it off as a group.
+        for DSPGroup, state, (outputX, outputY) in zip(
+                DSPGroups, operation.groupStates, segmentPixels):
+            if (state.outputStored):
+                continue
+            if (state.channelsInFlight > 0):
+                if (not any(DSPunit.isActive() for DSPunit in DSPGroup)):
+                    state.channelsCompleted += state.channelsInFlight
+                    state.channelsInFlight = 0
+
+            firstChannelToPreload = state.channelsCompleted + state.channelsInFlight
+            remainingChannels = int(channelsIn[operation.layer] - firstChannelToPreload)
+            if (remainingChannels == 0):
+                continue
+            channelsThisBatch = min(
+                remainingChannels,
+                DSPS_PER_ACCUMULATOR * POINTWISE_VALUES_PER_DSP)
+            nextBatchReady = self.preloadPointwiseGroup(
+                    operation,
+                    DSPGroup,
+                    outputX,
+                    outputY,
+                    firstChannelToPreload,
+                    channelsThisBatch)
+            if (state.channelsInFlight == 0 and nextBatchReady):
+                for DSPunit in DSPGroup[:min(channelsThisBatch, DSPS_PER_ACCUMULATOR)]:
+                    DSPunit.loadKernel()
+                    DSPunit.loadActivation()
+                    DSPunit.startDotProduct()
+                state.channelsInFlight = channelsThisBatch
+
+        # Retire ready pixels independently. A busy SRAM or an unfinished
+        # group does not prevent another pixel from storing its output.
+        SRAMStoreOrder = self.getPointwiseSRAMStoreOrder(operation.layer, segmentPixels)
+        for DSPGroupIndex in SRAMStoreOrder:
+            state = operation.groupStates[DSPGroupIndex]
+            if (state.outputStored or state.channelsCompleted != channelsIn[operation.layer]):
+                continue
+            accumulator = DSPGroups[DSPGroupIndex][0].accumulator
+            if (not accumulator.hasOutputReady()):
+                continue
+
+            activation = accumulator.getOutput()
+            if (not isinstance(activation, Activation)):
+                raise Exception("ERROR! Completed pointwise accumulation did not produce an activation")
+            if (activation.channel != operation.outputChannel):
+                raise Exception("ERROR! Pointwise output channel does not match its operation")
+            expectedX, expectedY = segmentPixels[DSPGroupIndex]
+            if (activation.x != expectedX or activation.y != expectedY):
+                raise Exception("ERROR! Pointwise output pixel does not match its DSP accumulator group")
+            if (not memory.loadActivationToSRAM(activation)):
+                continue
+
+            accumulator.clearOutput()
+            state.outputStored = True
+
+        return all(state.outputStored for state in operation.groupStates)
+
+    def startPointwiseConv(self, layer, quarter, completedQuarters=None):
+        self.getPointwiseSegmentPixels(layer, quarter, 0)
+        if (not pixelMap.isQuarterFinished(layer - 1, quarter)):
+            raise Exception("Attempting to pointwise convolution a non-existent layer quarter")
+        if (pixelMap.isQuarterFinished(layer, quarter)):
+            return False
+        if (self.pwConvEnq(layer, quarter)):
+            return False
+
+        if (completedQuarters is None):
+            completedQuarters = pixelMap.getCompletedQuarters(layer)
+        completedQuarters = tuple(completedQuarters)
+        for completedQuarter in completedQuarters:
+            if (not pixelMap.isQuarterFinished(layer, completedQuarter)):
+                raise Exception("ERROR! Pointwise enqueue context includes an unfinished quarter")
+        pendingQuarters = tuple(
+            operation.quarter for operation in self.operationFIFO
+            if isinstance(operation, PointwiseSupervisorOperation) and operation.layer == layer)
+        # Earlier supervisors own overlapping pixels until their stores finish;
+        # later supervisors skip those pixels and wait for their completion.
+        pixelSegments = self.getPointwiseQuarterSegments(
+            layer, quarter, completedQuarters + pendingQuarters)
+        pointwiseSupervisorOp = PointwiseSupervisorOperation(
+            layer=layer,
+            tag=self.tagCounter,
+            quarter=quarter,
+            completedQuarters=completedQuarters,
+            pendingQuarters=pendingQuarters,
+            pixelSegments=pixelSegments)
+        self.tagCounter += 1
+        self.fifoPush(pointwiseSupervisorOp)
+        return True
+
+    def getDepthwiseQuarterPixels(self, layer, quarter):
+        xStart, xEnd, yStart, yEnd = pixelMap.getQuarterBounds(layer, quarter)
+        return [
+            (x, y)
+            for y in range(yStart, yEnd)
+            for x in range(xStart, xEnd)
+        ]
+
+    def isDepthwiseInputRegionFinished(self, layer, quarter):
+        outputXStart, outputXEnd, outputYStart, outputYEnd = (
+            pixelMap.getQuarterBounds(layer, quarter)
+        )
+        sourceLayer = layer - 1
+        kernelRadius = DEPTHWISE_KERNEL_SIZE // 2
+        inputXStart = max(0, outputXStart * stride[layer] - kernelRadius)
+        inputXEnd = min(
+            spatialOutput[sourceLayer],
+            (outputXEnd - 1) * stride[layer] + kernelRadius + 1)
+        inputYStart = max(0, outputYStart * stride[layer] - kernelRadius)
+        inputYEnd = min(
+            spatialOutput[sourceLayer],
+            (outputYEnd - 1) * stride[layer] + kernelRadius + 1)
+        return pixelMap.isRegionFinished(
+            sourceLayer,
+            inputXStart,
+            inputXEnd,
+            inputYStart,
+            inputYEnd)
+
+    def getDepthwiseDSPKernelParts(self, layer, outputX, outputY):
+        inputCenterX = outputX * stride[layer]
+        inputCenterY = outputY * stride[layer]
+        inputSpatialSize = spatialOutput[layer - 1]
+        kernelRadius = DEPTHWISE_KERNEL_SIZE // 2
+        staticParts = ((0, 1, 2), (3, 4), (5, 6), (7, 8))
+        return [
+            tuple(
+                kernelPart
+                for kernelPart in DSPParts
+                if (
+                    0 <= inputCenterX + (kernelPart % DEPTHWISE_KERNEL_SIZE) - kernelRadius < inputSpatialSize
+                    and 0 <= inputCenterY + (kernelPart // DEPTHWISE_KERNEL_SIZE) - kernelRadius < inputSpatialSize)
+            )
+            for DSPParts in staticParts
+        ]
+
+    def depthwiseKernelMatches(self, kernel, layer, channel, kernelParts):
+        return (
+            isinstance(kernel, DepthwiseKernel)
+            and kernel.layer == layer
+            and kernel.channel == channel
+            and kernel.kernelParts == tuple(kernelParts)
+            and kernel.valuesStored == len(kernelParts))
+
+    def depthwiseActivationMatches(
+            self,
+            activationChunk,
+            layer,
+            outputX,
+            outputY,
+            channel,
+            kernelParts):
+        return (
+            isinstance(activationChunk, ActivationChunk)
+            and activationChunk.type == "depthwise"
+            and activationChunk.layer == layer
+            and activationChunk.x == outputX * stride[layer]
+            and activationChunk.y == outputY * stride[layer]
+            and activationChunk.channel == channel
+            and activationChunk.kernelParts == tuple(kernelParts)
+            and activationChunk.valuesStored == len(kernelParts))
+
+    def activationAskForKernel(
+            self,
+            operation: DepthwiseConvOperation,
+            DSPGroups,
+            batchPixels):
+        # The full nine-weight kernel is fetched from LRAM once per channel
+        # child and retained in a local operation buffer.
+        if (operation.bufferedKernel is None):
+            kernelLoadDSP = DSPGroups[0][0]
+            desiredKernel = DepthwiseKernel(
+                layer=operation.layer,
+                channel=operation.channel)
+            if (not memory.askForKernel(desiredKernel, kernelLoadDSP.getID())):
+                return False
+            if (kernelLoadDSP.preloadedKernel != desiredKernel):
+                raise Exception("ERROR! Depthwise kernel buffer received the wrong complete kernel")
+            operation.bufferedKernel = replace(kernelLoadDSP.preloadedKernel)
+
+        # Split and broadcast the buffered kernel into the four DSP preload
+        # slots for every pixel. getDepthwiseDSPKernelParts removes positions
+        # whose activations are outside the frame.
+        if (not operation.kernelDistributedForBatch):
+            completeKernelParts = set(operation.bufferedKernel.kernelParts)
+            if (completeKernelParts != set(range(DEPTHWISE_KERNEL_PARTS))):
+                raise Exception("ERROR! Buffered depthwise kernel is incomplete")
+
+            for groupIndex, (outputX, outputY) in enumerate(batchPixels):
+                kernelPartsByDSP = self.getDepthwiseDSPKernelParts(
+                    operation.layer,
+                    outputX,
+                    outputY)
+                for DSPoffset, kernelParts in enumerate(kernelPartsByDSP):
+                    DSPunit = DSPGroups[groupIndex][DSPoffset]
+                    if (len(kernelParts) == 0):
+                        DSPunit.preloadedKernel = DepthwiseKernel()
+                        DSPunit.preloadedActivationChunk = ActivationChunk(type="depthwise")
+                        continue
+                    if (not set(kernelParts).issubset(completeKernelParts)):
+                        raise Exception("ERROR! Depthwise kernel split requested an unavailable weight")
+                    DSPunit.preloadKernel(DepthwiseKernel(
+                        layer=operation.layer,
+                        channel=operation.channel,
+                        kernelParts=tuple(kernelParts),
+                        valuesStored=len(kernelParts)))
+
+            operation.kernelDistributedForBatch = True
+
+        # Load the activation positions paired with each DSP's kernel slots.
+        # The cursor makes SRAM conflicts resumable without rereading LRAM.
+        totalDSPsToLoad = len(batchPixels) * DSPS_PER_ACCUMULATOR
+        while (operation.nextDSPToLoad < totalDSPsToLoad):
+            groupIndex = operation.nextDSPToLoad // DSPS_PER_ACCUMULATOR
+            DSPoffset = operation.nextDSPToLoad % DSPS_PER_ACCUMULATOR
+            outputX, outputY = batchPixels[groupIndex]
+            kernelParts = self.getDepthwiseDSPKernelParts(
+                operation.layer,
+                outputX,
+                outputY)[DSPoffset]
+            DSPunit = DSPGroups[groupIndex][DSPoffset]
+
+            if (len(kernelParts) == 0):
+                operation.nextDSPToLoad += 1
+                continue
+            if (not self.depthwiseKernelMatches(
+                    DSPunit.preloadedKernel,
+                    operation.layer,
+                    operation.channel,
+                    kernelParts)):
+                raise Exception("ERROR! Depthwise kernel was split into the wrong DSP slot")
+            if (not self.depthwiseActivationMatches(
+                    DSPunit.preloadedActivationChunk,
+                    operation.layer,
+                    outputX,
+                    outputY,
+                    operation.channel,
+                    kernelParts)):
+                if (not memory.askForDepthwiseActivationChunk(
+                        operation.layer,
+                        outputX,
+                        outputY,
+                        operation.channel,
+                        kernelParts,
+                        DSPunit.getID())):
+                    return False
+
+            operation.nextDSPToLoad += 1
+
+        return True
+
+    def getDepthwiseSupervisorByTag(self, supervisorTag):
+        matchingSupervisors = [
+            operation
+            for operation in self.operationFIFO
+            if (
+                isinstance(operation, DepthwiseSupervisorOperation)
+                and operation.tag == supervisorTag)
+        ]
+        if (len(matchingSupervisors) != 1):
+            raise Exception("ERROR! Depthwise child operation could not find its supervisor")
+        return matchingSupervisors[0]
+
+    def notifyDepthwiseChildComplete(self, operation: DepthwiseConvOperation):
+        supervisor = self.getDepthwiseSupervisorByTag(operation.supervisorTag)
+        if (supervisor.layer != operation.layer or supervisor.quarter != operation.quarter):
+            raise Exception("ERROR! Depthwise child completion does not match its supervisor")
+        if (supervisor.childrenInFlight <= 0):
+            raise Exception("ERROR! Depthwise supervisor received an unexpected child completion")
+        supervisor.childrenInFlight -= 1
+        supervisor.childrenCompleted += 1
+
+    def startDepthwiseChildOperation(
+            self,
+            supervisor: DepthwiseSupervisorOperation,
+            channel):
+        quarterPixels = self.getDepthwiseQuarterPixels(
+            supervisor.layer,
+            supervisor.quarter)
+        freeDSPGroups = self.getFreeAccumulatorDSPGroups(len(quarterPixels))
+        if (len(freeDSPGroups) == 0):
+            return False
+
+        freeDSPs = [
+            DSPunit
+            for DSPGroup in freeDSPGroups
+            for DSPunit in DSPGroup
+        ]
+        childTag = self.tagCounter
+        self.assignOperationTag(freeDSPs, childTag)
+        self.fifoPush(DepthwiseConvOperation(
+            layer=supervisor.layer,
+            tag=childTag,
+            supervisorTag=supervisor.tag,
+            stride=int(stride[supervisor.layer]),
+            quarter=supervisor.quarter,
+            channel=channel,
+            numDSPGroups=len(freeDSPGroups)))
+        self.tagCounter += 1
+        return True
+
+    def processDepthwiseSupervisorOperation(
+            self,
+            operation: DepthwiseSupervisorOperation):
+        if (operation.childrenCompleted + operation.childrenInFlight != operation.nextChannel):
+            raise Exception("ERROR! Depthwise supervisor child counters are inconsistent")
+
+        allChildrenIssued = operation.nextChannel == channelsOut[operation.layer]
+        if (allChildrenIssued and operation.childrenInFlight == 0):
+            if (operation.childrenCompleted != channelsOut[operation.layer]):
+                raise Exception("ERROR! Depthwise supervisor completed without all channels")
+            pixelMap.setQuarterFinished(operation.layer, operation.quarter)
+            return True
+
+        while (operation.nextChannel < channelsOut[operation.layer]):
+            if (not self.startDepthwiseChildOperation(operation, operation.nextChannel)):
+                break
+            operation.nextChannel += 1
+            operation.childrenInFlight += 1
+
+        return False
+
+    def processDepthwiseConvOperation(self, operation: DepthwiseConvOperation):
+        DSPunits = self.getDSPsWithOpTag(operation.tag)
+        DSPGroups = [
+            DSPunits[index:index + DSPS_PER_ACCUMULATOR]
+            for index in range(0, len(DSPunits), DSPS_PER_ACCUMULATOR)
+        ]
+        if (
+                len(DSPGroups) != operation.numDSPGroups
+                or any(len(DSPGroup) != DSPS_PER_ACCUMULATOR for DSPGroup in DSPGroups)):
+            raise Exception("ERROR! Depthwise operation has an invalid DSP allocation")
+
+        quarterPixels = self.getDepthwiseQuarterPixels(operation.layer, operation.quarter)
+        batchSize = min(
+            operation.numDSPGroups,
+            len(quarterPixels) - operation.batchStartPixel)
+        if (batchSize <= 0):
+            raise Exception("ERROR! Depthwise operation attempted to process an empty pixel batch")
+        batchPixels = quarterPixels[
+            operation.batchStartPixel:operation.batchStartPixel + batchSize
+        ]
+
+        if (operation.step == 0):
+            if (not self.activationAskForKernel(
+                    operation,
+                    DSPGroups,
+                    batchPixels)):
+                return False
+
+            for groupIndex, (outputX, outputY) in enumerate(batchPixels):
+                kernelPartsByDSP = self.getDepthwiseDSPKernelParts(
+                    operation.layer,
+                    outputX,
+                    outputY)
+                for DSPoffset, kernelParts in enumerate(kernelPartsByDSP):
+                    if (len(kernelParts) == 0):
+                        continue
+                    DSPunit = DSPGroups[groupIndex][DSPoffset]
+                    if (not self.depthwiseKernelMatches(
+                            DSPunit.preloadedKernel,
+                            operation.layer,
+                            operation.channel,
+                            kernelParts)):
+                        raise Exception("ERROR! Depthwise DSP is missing its kernel chunk")
+                    if (not self.depthwiseActivationMatches(
+                            DSPunit.preloadedActivationChunk,
+                            operation.layer,
+                            outputX,
+                            outputY,
+                            operation.channel,
+                            kernelParts)):
+                        raise Exception("ERROR! Depthwise DSP is missing its activation chunk")
+                    DSPunit.loadKernel()
+                    DSPunit.loadActivation()
+                    DSPunit.startDotProduct()
+
+            operation.step = 1
+            return False
+
+        if (operation.step == 1):
+            if (any(DSPunit.isActive() for DSPGroup in DSPGroups[:batchSize] for DSPunit in DSPGroup)):
+                return False
+            operation.step = 2
+            return False
+
+        if (operation.step == 2):
+            while (operation.nextOutputToStore < batchSize):
+                groupIndex = operation.nextOutputToStore
+                accumulator = DSPGroups[groupIndex][0].accumulator
+                if (not accumulator.hasOutputReady()):
+                    return False
+                activation = accumulator.getOutput()
+                if (
+                        not isinstance(activation, Activation)
+                        or activation.type != "depthwise"
+                        or activation.layer != operation.layer
+                        or activation.channel != operation.channel
+                        or (activation.x, activation.y) != batchPixels[groupIndex]):
+                    raise Exception("ERROR! Depthwise accumulator produced the wrong activation")
+                if (not memory.loadActivationToSRAM(activation)):
+                    return False
+                accumulator.clearOutput()
+                operation.nextOutputToStore += 1
+
+            operation.batchStartPixel += batchSize
+            if (operation.batchStartPixel == len(quarterPixels)):
+                return True
+
+            operation.step = 0
+            operation.nextDSPToLoad = 0
+            operation.nextOutputToStore = 0
+            operation.kernelDistributedForBatch = False
+            return False
+
+        raise Exception("ERROR! Depthwise operation has an unrecognized step")
+
+    def startDepthwiseConv(self, layer, quarter):
+        if (layer <= 0 or layer >= layers or layerList[layer] != "depthwise"):
+            raise Exception("ERROR! Invalid depthwise convolution layer")
+        if (channelsIn[layer] != channelsOut[layer]):
+            raise Exception("ERROR! Depthwise convolution input/output channels must match")
+        if (channelsOut[layer - 1] != channelsIn[layer]):
+            raise Exception("ERROR! Depthwise convolution input channels do not match its source layer")
+        self.getDepthwiseQuarterPixels(layer, quarter)
+        if (not self.isDepthwiseInputRegionFinished(layer, quarter)):
+            return False
+        if (pixelMap.isQuarterFinished(layer, quarter) or self.dwConvEnq(layer, quarter)):
+            return False
+
+        self.fifoPush(DepthwiseSupervisorOperation(
+            layer=layer,
+            tag=self.tagCounter,
+            quarter=quarter))
+        self.tagCounter += 1
+        return True
+
+    def startFullyConnected(self):
+        if (self.fullyConnectedComplete or self.isFullyConnectedCalculating()):
+            return False
+
+        self.fifoPush(FullyConnectedOperation(tag=self.tagCounter))
+        self.tagCounter += 1
+        return True
+
     def startSEVectorCalc(self, layer):
         if (not pixelMap.isLayerFinished(layer)):
             # May want to remove this later to see how calculating SE vector with uncomplete averages
             # affects performance
             raise Exception("Trying to calculate SE Vector of unfinished layer")
-
-        expectedDSPSpan = self.getSEDSPSpanForRows(layer, SEMACsPerDSP[layer], False)
-        if (SEDSPsNeeded[layer] != expectedDSPSpan):
-            raise Exception("ERROR! Squeeze DSPs Needed must include active squeeze DSPs and skipped DSP slots")
 
         freeDSPs = self.getFreeDSPsForSERows(layer, SEMACsPerDSP[layer], False)
         
@@ -1630,12 +3079,11 @@ class DSPmanager:
             operation = self.fifoPeek(fifoIndex)
             
             # Depthwise convolutions go left to right, top to bottom
-            INITIAL_CONVOLUTION_K = 3
             if isinstance(operation, CameraDepthwiseConvOperation):
-                kernelRadius = INITIAL_CONVOLUTION_K // 2
+                kernelRadius = DEPTHWISE_KERNEL_SIZE // 2
                 cameraActivationList = []
-                for height in range(INITIAL_CONVOLUTION_K):
-                    for width in range(INITIAL_CONVOLUTION_K):
+                for height in range(DEPTHWISE_KERNEL_SIZE):
+                    for width in range(DEPTHWISE_KERNEL_SIZE):
                         activationX = operation.targetX + (width - kernelRadius)
                         activationY = operation.targetY + (height - kernelRadius)
                         if (activationX < 0 or activationX >= imxCamera.width):
@@ -1668,10 +3116,9 @@ class DSPmanager:
                     for DSPunit in DSPunits:
                         DSPunit.setOperationTag(None)
                     pixelMap.setPixelFinished(operation.targetX // stride[0], operation.targetY // stride[0], 0)
-                    self.fifoPop()
-                    fifoIndex -= 1
+                    self.fifoRemove(fifoIndex)
                     return
-                
+
                 if (operation.nextToRead < operation.nextToTrigger):
                     for channel in range(operation.nextToRead, operation.nextToTrigger):
                         accumulatorToRead = DSPGroups[channel][0].accumulator
@@ -1708,6 +3155,11 @@ class DSPmanager:
 
                         if (result == False):
                             break
+
+                        DSPunit.preloadedKernel = replace(
+                            DSPunit.preloadedKernel,
+                            kernelParts=activationChunk.kernelParts,
+                            valuesStored=activationChunk.valuesStored)
                         
                         operation.nextToLoad += 1
 
@@ -1721,37 +3173,53 @@ class DSPmanager:
                     if (exciteOperationComplete):
                         operation.exciteOperationComplete = True
                         pixelMap.setSEVectorCalculated(operation.layer)
+                        # The squeeze sums and sample counts are a shared temporary
+                        # buffer. Once this layer's complete SE vector is stored,
+                        # reset them before a later SE layer begins accumulating.
+                        memory.clearAccumulator()
                         if (operation.exciteTag is not None):
                             for DSPunit in self.getDSPsWithOpTag(operation.exciteTag):
                                 DSPunit.setOperationTag(None)
                         self.fifoRemove(fifoIndex)
                         return
-            
-# @dataclass
-# class PointwiseConvOperation:
-#     type: Literal["pointwise"]
-#     layer: int
-#     tag: int
-#     segment: int
-#     outputChannel: int
-#     step: int = 0
-#     channelsCompleted: int = 0
+
+            if (isinstance(operation, FullyConnectedOperation)):
+                fullyConnectedOperationComplete = self.processFullyConnectedOperation(operation)
+                if (fullyConnectedOperationComplete):
+                    self.fullyConnectedComplete = True
+                    self.fifoRemove(fifoIndex)
+                    return
+
+            if (isinstance(operation, PointwiseSupervisorOperation)):
+                pointwiseSupervisorComplete = self.processPointwiseSupervisorOperation(operation)
+                if (pointwiseSupervisorComplete):
+                    self.fifoRemove(fifoIndex)
+                    return
+
             if (isinstance(operation, PointwiseConvOperation)):
-                # desired behavior:
-                # For the specified segment, each pixel in that segment should correspond to a DSP
-                # accumulator.
-                # The number of channels accumulated starts at 0
-                # If (total_channels - channels_accumulated) is greater than 36, then load the next 36 indices
-                # from the pointwise kernel, and load the next 36 channel activations from all of those pixels
-                # If (total_channels - channels_accumulated) is less than 36, then load the remaining indices
-                # from the pointwise kernel, and the remaining channel activations from all of those pixels
-                
-                # Now, 
-                pass
-                
-                
-                
-                
+                pointwiseOperationComplete = self.processPointwiseConvOperation(operation)
+                if (pointwiseOperationComplete):
+                    self.notifyPointwiseChildComplete(operation)
+                    for DSPunit in self.getDSPsWithOpTag(operation.tag):
+                        DSPunit.setOperationTag(None)
+                    self.fifoRemove(fifoIndex)
+                    return
+
+            if (isinstance(operation, DepthwiseSupervisorOperation)):
+                depthwiseSupervisorComplete = self.processDepthwiseSupervisorOperation(operation)
+                if (depthwiseSupervisorComplete):
+                    self.fifoRemove(fifoIndex)
+                    return
+
+            if (isinstance(operation, DepthwiseConvOperation)):
+                depthwiseOperationComplete = self.processDepthwiseConvOperation(operation)
+                if (depthwiseOperationComplete):
+                    self.notifyDepthwiseChildComplete(operation)
+                    for DSPunit in self.getDSPsWithOpTag(operation.tag):
+                        DSPunit.setOperationTag(None)
+                    self.fifoRemove(fifoIndex)
+                    return
+
             fifoIndex += 1
             toCheck -= 1
     
@@ -1812,7 +3280,10 @@ MAX_SIMULTANEOUS_SRAM_WRITES = NUM_SRAMS
 
 WEIGHTS_PER_LRAM_ADDRESS = 4
 SE_WEIGHTS_PER_SRAM_ADDRESS = 2
-MAX_SQUEEZE_EXCITE_CHANNELS = 243
+MAX_SQUEEZE_EXCITE_CHANNELS = 244
+MAX_CHANNEL_AVERAGE_CHANNELS = max(
+    MAX_SQUEEZE_EXCITE_CHANNELS,
+    int(np.max(channelsOut)))
 SRAM_ADDRESSES = 1024
 
 # SRAM indices 0 through ACTIVATION_SRAM_START_INDEX - 1 are reserved for
@@ -1858,9 +3329,12 @@ class memoryManager:
         # This is for finding weights
         self.startOfLayer = np.zeros((layers, 3), dtype=int)
         self.startOfSELayer = np.zeros((layers, 3), dtype=int)
+        # Strided pointwise reads can span multiple addresses in one LRAM.
+        # Preserve completed reads across cycles instead of exceeding its port limit.
+        self.pendingPointwiseKernelReads = {}
 
-        self.squeezeExciteAccumulator = np.zeros(MAX_SQUEEZE_EXCITE_CHANNELS)
-        self.squeezeExciteAccumulatorCount = np.zeros(MAX_SQUEEZE_EXCITE_CHANNELS, dtype=int)
+        self.squeezeExciteAccumulator = np.zeros(MAX_CHANNEL_AVERAGE_CHANNELS)
+        self.squeezeExciteAccumulatorCount = np.zeros(MAX_CHANNEL_AVERAGE_CHANNELS, dtype=int)
         self.SEHiddenLayerVector = SEHiddenLayerVector(length=0)
         
         self.operationFIFO = deque()
@@ -1868,10 +3342,13 @@ class memoryManager:
         self.memTagPopCounter = 0
 
     def addActivationToSqueezeExciteAccumulator(self, activation: Activation):
-        if (squeezeExcite[activation.layer] != 1):
+        nextLayerIsGAP = (
+            activation.layer + 1 < layers
+            and layerList[activation.layer + 1] == "gap")
+        if (squeezeExcite[activation.layer] != 1 and not nextLayerIsGAP):
             return
-        if (activation.channel < 0 or activation.channel >= MAX_SQUEEZE_EXCITE_CHANNELS):
-            raise Exception("ERROR! Activation channel is outside the squeeze-excite accumulator range")
+        if (activation.channel < 0 or activation.channel >= MAX_CHANNEL_AVERAGE_CHANNELS):
+            raise Exception("ERROR! Activation channel is outside the channel-average accumulator range")
 
         self.squeezeExciteAccumulator[activation.channel] += activation.value
         self.squeezeExciteAccumulatorCount[activation.channel] += 1
@@ -1894,8 +3371,8 @@ class memoryManager:
         return SEVectorIndex(type="input", layer=layer, channel=channel, value=np.uint8(averageValue))
 
     def SEVectorIndexToSEVectorChunk(self, SEVectorIndexList):
-        if (len(SEVectorIndexList) <= 0 or len(SEVectorIndexList) > SE_VECTOR_CHUNK_PARTS):
-            raise Exception("ERROR! SE vector chunk must be made from 1 to 9 SE vector indexes")
+        if (len(SEVectorIndexList) <= 0 or len(SEVectorIndexList) > DSP_CHUNK_SIZE):
+            raise Exception(f"ERROR! SE vector chunk must be made from 1 to {DSP_CHUNK_SIZE} SE vector indexes")
         if (any(SEVectorIndexObj is None for SEVectorIndexObj in SEVectorIndexList)):
             raise Exception("ERROR! Cannot make SE vector chunk from empty SE vector index")
 
@@ -1961,7 +3438,15 @@ class memoryManager:
         self.setSEHiddenLayerVector(SEHiddenLayerVectorObj)
         return SEHiddenLayerVectorObj
 
-    def getSEWeightChunksForDSP(self, layer, isExpansion, dspIndex, weightsPerDSP, weightsLoaded, weightsToLoad):
+    def getSEWeightChunksForDSP(
+            self,
+            layer,
+            isExpansion,
+            dspIndex,
+            weightsPerDSP,
+            weightsLoaded,
+            weightsToLoad,
+            outputChannelStart=0):
         if (weightsPerDSP < 0):
             raise Exception("ERROR! weightsPerDSP cannot be negative")
         if (weightsLoaded < 0):
@@ -1977,6 +3462,8 @@ class memoryManager:
 
         DSPsPerRow = math.ceil(inputVectorLength / weightsPerDSP)
         row = dspIndex // DSPsPerRow
+        if (isExpansion):
+            row += outputChannelStart
         dspIndexInRow = dspIndex % DSPsPerRow
 
         layerStart = self.startOfSELayer[layer]
@@ -2005,8 +3492,8 @@ class memoryManager:
             raise Exception("ERROR! Cannot load empty SE weight into DSP")
 
         weightChunks = [
-            weights[index:index + KERNEL_WEIGHT_CAP]
-            for index in range(0, len(weights), KERNEL_WEIGHT_CAP)
+            weights[index:index + DSP_CHUNK_SIZE]
+            for index in range(0, len(weights), DSP_CHUNK_SIZE)
         ]
         if (len(weightChunks) == 0):
             weightChunks.append([])
@@ -2037,8 +3524,8 @@ class memoryManager:
             SEVectorIndexes.append(self.readAveragedChannel(layer, activationChannel))
 
         SEVectorIndexChunks = [
-            SEVectorIndexes[index:index + SE_VECTOR_CHUNK_PARTS]
-            for index in range(0, len(SEVectorIndexes), SE_VECTOR_CHUNK_PARTS)
+            SEVectorIndexes[index:index + DSP_CHUNK_SIZE]
+            for index in range(0, len(SEVectorIndexes), DSP_CHUNK_SIZE)
         ]
 
         return [
@@ -2070,8 +3557,8 @@ class memoryManager:
             SEhiddenLayerElems.append(self.readSEHiddenLayerElem(layer, elemNumber))
 
         SEhiddenLayerElemChunks = [
-            SEhiddenLayerElems[index:index + SE_VECTOR_CHUNK_PARTS]
-            for index in range(0, len(SEhiddenLayerElems), SE_VECTOR_CHUNK_PARTS)
+            SEhiddenLayerElems[index:index + DSP_CHUNK_SIZE]
+            for index in range(0, len(SEhiddenLayerElems), DSP_CHUNK_SIZE)
         ]
 
         return [
@@ -2081,6 +3568,160 @@ class memoryManager:
                 channel=SEhiddenLayerElemChunk[0].elemNumber,
                 valuesStored=len(SEhiddenLayerElemChunk))
             for SEhiddenLayerElemChunk in SEhiddenLayerElemChunks
+        ]
+
+    def getFullyConnectedWeightChunksForDSP(
+            self,
+            stage,
+            dspIndex,
+            weightsPerDSP,
+            weightsLoaded,
+            weightsToLoad,
+            outputChannelStart):
+        if (stage < 0 or stage > 1):
+            raise Exception("ERROR! Fully connected stage must be 0 or 1")
+        if (dspIndex < 0 or dspIndex >= NUM_DSPS):
+            raise Exception("ERROR! Fully connected DSP index is outside the DSP range")
+        if (weightsPerDSP <= 0 or weightsLoaded < 0 or weightsToLoad <= 0):
+            raise Exception("ERROR! Fully connected weight request is invalid")
+
+        layer = FULLY_CONNECTED_LAYER_START + stage
+        inputVectorLength = FULLY_CONNECTED_INPUT if stage == 0 else FULLY_CONNECTED_HIDDEN
+        outputVectorLength = FULLY_CONNECTED_HIDDEN if stage == 0 else FULLY_CONNECTED_OUTPUT
+        DSPsPerRow = math.ceil(inputVectorLength / weightsPerDSP)
+        row = outputChannelStart + (dspIndex // DSPsPerRow)
+        dspIndexInRow = dspIndex % DSPsPerRow
+        columnStart = dspIndexInRow * weightsPerDSP + weightsLoaded
+        if (row < 0 or row >= outputVectorLength):
+            raise Exception("ERROR! Fully connected weight row is outside the output vector")
+        if (columnStart < 0 or columnStart + weightsToLoad > inputVectorLength):
+            raise Exception("ERROR! Fully connected weight request crosses a matrix row")
+
+        trueOffset = row * inputVectorLength + columnStart
+        layerLRAMStart, layerAddrStart, layerPackedStart = self.startOfLayer[layer]
+        packedOffset = int(layerPackedStart) + trueOffset
+        LRAMWordOffset, packedIndex = divmod(packedOffset, WEIGHTS_PER_LRAM_ADDRESS)
+        logicalLRAM = int(layerLRAMStart) + LRAMWordOffset
+        LRAMNum = logicalLRAM % NUM_LRAMS
+        LRAMAddr = int(layerAddrStart) + (logicalLRAM // NUM_LRAMS)
+
+        weights = []
+        if (not self.readSequentially(LRAMNum, LRAMAddr, packedIndex, weightsToLoad, weights)):
+            return False
+        for offset, weight in enumerate(weights):
+            if (
+                    not isinstance(weight, FullyConnectedWeight)
+                    or weight.layer != layer
+                    or weight.row != row
+                    or weight.column != columnStart + offset):
+                raise Exception("ERROR! LRAM returned the wrong fully connected weight")
+
+        return [
+            SEKernel(weights=weights[index:index + DSP_CHUNK_SIZE])
+            for index in range(0, len(weights), DSP_CHUNK_SIZE)
+        ]
+
+    def getFullyConnectedVectorLocation(self, vectorIndex, isFinalOutput=False):
+        vectorLength = FULLY_CONNECTED_OUTPUT if isFinalOutput else FULLY_CONNECTED_HIDDEN
+        if (vectorIndex < 0 or vectorIndex >= vectorLength):
+            raise Exception("ERROR! Fully connected vector index is outside the SRAM scratch range")
+        scratchOffset = FULLY_CONNECTED_HIDDEN if isFinalOutput else 0
+        if (scratchOffset + vectorIndex >= MAX_SQUEEZE_EXCITE_CHANNELS):
+            raise Exception("ERROR! Fully connected vectors exceed the reusable SE SRAM region")
+        trueIndex = SEWEIGHTTOTALBYTES + scratchOffset + vectorIndex
+        packedIndex = trueIndex % SE_WEIGHTS_PER_SRAM_ADDRESS
+        SRAMJumps = trueIndex // SE_WEIGHTS_PER_SRAM_ADDRESS
+        return (
+            SRAMJumps % NUM_SRAMS,
+            SRAMJumps // NUM_SRAMS,
+            packedIndex)
+
+    def loadFullyConnectedVectorPart(self, vectorPart: SEVectorIndex):
+        if (not isinstance(vectorPart, SEVectorIndex)):
+            raise Exception("ERROR! Fully connected output must be a vector index")
+        if (vectorPart.layer not in (FULLY_CONNECTED_LAYER_START, FULLY_CONNECTED_LAYER_START + 1)):
+            raise Exception("ERROR! Fully connected vector part has the wrong layer")
+        expectedType = "input" if vectorPart.layer == FULLY_CONNECTED_LAYER_START else "output"
+        expectedLength = (
+            FULLY_CONNECTED_HIDDEN
+            if vectorPart.layer == FULLY_CONNECTED_LAYER_START
+            else FULLY_CONNECTED_OUTPUT)
+        if (vectorPart.type != expectedType or vectorPart.channel < 0 or vectorPart.channel >= expectedLength):
+            raise Exception("ERROR! Fully connected vector part has invalid metadata")
+
+        SRAMNum, SRAMAddr, packedIndex = self.getFullyConnectedVectorLocation(
+            vectorPart.channel,
+            isFinalOutput=(vectorPart.layer == FULLY_CONNECTED_LAYER_START + 1))
+        SRAMobj = self.allSRAM[SRAMNum]
+        if (SRAMobj.isActiveRead() or SRAMobj.isActiveWrite()):
+            return False
+        packedParts = list(SRAMobj.readSRAM(SRAMAddr))
+        packedParts[packedIndex] = vectorPart
+        SRAMobj.writeSRAM(SRAMAddr, packedParts)
+        return True
+
+    def readFullyConnectedHiddenVectorParts(self, firstIndex, valuesToRead):
+        if (firstIndex < 0 or valuesToRead <= 0 or firstIndex + valuesToRead > FULLY_CONNECTED_HIDDEN):
+            raise Exception("ERROR! Fully connected hidden-vector read is outside the SRAM scratch range")
+
+        locations = [
+            self.getFullyConnectedVectorLocation(index)
+            for index in range(firstIndex, firstIndex + valuesToRead)
+        ]
+        SRAMWords = {(SRAMNum, SRAMAddr) for SRAMNum, SRAMAddr, _ in locations}
+        if (any(self.allSRAM[SRAMNum].isActiveRead() for SRAMNum, _ in SRAMWords)):
+            return False
+
+        packedWords = {
+            (SRAMNum, SRAMAddr): self.allSRAM[SRAMNum].readSRAM(SRAMAddr)
+            for SRAMNum, SRAMAddr in SRAMWords
+        }
+        vectorParts = []
+        for expectedIndex, (SRAMNum, SRAMAddr, packedIndex) in enumerate(locations, start=firstIndex):
+            vectorPart = packedWords[(SRAMNum, SRAMAddr)][packedIndex]
+            if (
+                    not isinstance(vectorPart, SEVectorIndex)
+                    or vectorPart.type != "input"
+                    or vectorPart.layer != FULLY_CONNECTED_LAYER_START
+                    or vectorPart.channel != expectedIndex):
+                raise Exception("ERROR! SRAM returned the wrong fully connected hidden-vector part")
+            vectorParts.append(vectorPart)
+        return vectorParts
+
+    def getFullyConnectedInputChunksForDSP(
+            self,
+            stage,
+            dspIndex,
+            valuesPerDSP,
+            valuesLoaded,
+            valuesToLoad):
+        if (stage < 0 or stage > 1):
+            raise Exception("ERROR! Fully connected stage must be 0 or 1")
+        if (dspIndex < 0 or dspIndex >= NUM_DSPS):
+            raise Exception("ERROR! Fully connected DSP index is outside the DSP range")
+        if (valuesPerDSP <= 0 or valuesLoaded < 0 or valuesToLoad <= 0):
+            raise Exception("ERROR! Fully connected input request is invalid")
+
+        inputVectorLength = FULLY_CONNECTED_INPUT if stage == 0 else FULLY_CONNECTED_HIDDEN
+        DSPsPerRow = math.ceil(inputVectorLength / valuesPerDSP)
+        dspIndexInRow = dspIndex % DSPsPerRow
+        firstInputIndex = dspIndexInRow * valuesPerDSP + valuesLoaded
+        if (firstInputIndex + valuesToLoad > inputVectorLength):
+            raise Exception("ERROR! Fully connected input request crosses an input vector")
+
+        if (stage == 0):
+            vectorParts = [
+                self.readAveragedChannel(GAP_INPUT_LAYER, channel)
+                for channel in range(firstInputIndex, firstInputIndex + valuesToLoad)
+            ]
+        else:
+            vectorParts = self.readFullyConnectedHiddenVectorParts(firstInputIndex, valuesToLoad)
+            if (vectorParts == False):
+                return False
+
+        return [
+            self.SEVectorIndexToSEVectorChunk(vectorParts[index:index + DSP_CHUNK_SIZE])
+            for index in range(0, len(vectorParts), DSP_CHUNK_SIZE)
         ]
 
     def loadSEVectorOutput(self, SEVectorIndexObj: SEVectorIndex):
@@ -2297,14 +3938,16 @@ class memoryManager:
         return (newSRAMNum, newSRAMAddr, newPackedIndex)
 
     def weightsToKernel(self, weightList):
-        if (len(weightList) != POINTWISE_KERNEL_PARTS):
-            raise Exception("ERROR! Kernel must be made from exactly 9 weights")
+        if (not weightList):
+            raise Exception("ERROR! Cannot make kernel from an empty weight list")
         if (any(weight is None for weight in weightList)):
             raise Exception("ERROR! Cannot make kernel from empty weight")
 
         firstWeight = weightList[0]
 
         if (isinstance(firstWeight, DepthwiseWeight)):
+            if (len(weightList) != DEPTHWISE_KERNEL_PARTS):
+                raise Exception("ERROR! Depthwise kernel must be made from exactly 9 weights")
             if (firstWeight.part != 0):
                 raise Exception("ERROR! Depthwise kernel must start at part 0")
 
@@ -2316,24 +3959,28 @@ class memoryManager:
                 if (weight.part != idx):
                     raise Exception("ERROR! Depthwise weights are not sequential")
 
-            return DepthwiseKernel(layer=firstWeight.layer, channel=firstWeight.channel)
+            return DepthwiseKernel(
+                layer=firstWeight.layer,
+                channel=firstWeight.channel,
+                kernelParts=tuple(range(DEPTHWISE_KERNEL_PARTS)),
+                valuesStored=DEPTHWISE_KERNEL_PARTS)
 
         if (isinstance(firstWeight, PointwiseWeight)):
-            if (firstWeight.channel % POINTWISE_KERNEL_PARTS != 0):
-                raise Exception("ERROR! Pointwise kernel must start at an input channel divisible by 9")
-
-            for idx, weight in enumerate(weightList):
+            if (len(weightList) > DSP_CHUNK_SIZE):
+                raise Exception(f"ERROR! Pointwise kernel cannot contain more than {DSP_CHUNK_SIZE} weights")
+            for weight in weightList:
                 if (not isinstance(weight, PointwiseWeight)):
                     raise Exception("ERROR! Cannot make kernel from mixed weight types")
                 if (weight.layer != firstWeight.layer or weight.y != firstWeight.y):
                     raise Exception("ERROR! Pointwise weights are not in the same kernel")
-                if (weight.channel != firstWeight.channel + idx):
-                    raise Exception("ERROR! Pointwise weights are not sequential")
+            inputChannels = tuple(weight.channel for weight in weightList)
+            if (inputChannels != tuple(sorted(set(inputChannels)))):
+                raise Exception("ERROR! Pointwise weight channels must be distinct and increasing")
 
             return PointwiseKernel(
                 layer=firstWeight.layer,
                 channel=firstWeight.y,
-                channelGroup=firstWeight.channel // POINTWISE_KERNEL_PARTS)
+                inputChannels=inputChannels)
 
         raise Exception("ERROR! Unsupported weight type for kernel conversion")
     
@@ -2348,12 +3995,8 @@ class memoryManager:
             raise Exception("ERROR! Cannot make activation chunk from mixed activation types")
 
         if (firstActivation.type == "depthwise"):
-            layerKernelSize = kernelSize[firstActivation.layer]
-            kernelRadius = layerKernelSize // 2
+            kernelRadius = DEPTHWISE_KERNEL_SIZE // 2
             layerSpatialSize = spatialInput[firstActivation.layer]
-
-            if (layerKernelSize != 3 and layerKernelSize != 5):
-                raise Exception("ERROR! Unsupported depthwise activation kernel size")
 
             for activation in activationList:
                 if (activation.layer != firstActivation.layer or activation.channel != firstActivation.channel):
@@ -2365,11 +4008,11 @@ class memoryManager:
 
             activationCoordinates = [(activation.x, activation.y) for activation in activationList]
             possibleTopLeftCoordinates = []
-            for topLeftY in range(firstActivation.y - layerKernelSize + 1, firstActivation.y + 1):
-                for topLeftX in range(firstActivation.x - layerKernelSize + 1, firstActivation.x + 1):
+            for topLeftY in range(firstActivation.y - DEPTHWISE_KERNEL_SIZE + 1, firstActivation.y + 1):
+                for topLeftX in range(firstActivation.x - DEPTHWISE_KERNEL_SIZE + 1, firstActivation.x + 1):
                     expectedCoordinates = []
-                    for kernelY in range(layerKernelSize):
-                        for kernelX in range(layerKernelSize):
+                    for kernelY in range(DEPTHWISE_KERNEL_SIZE):
+                        for kernelX in range(DEPTHWISE_KERNEL_SIZE):
                             expectedX = topLeftX + kernelX
                             expectedY = topLeftY + kernelY
                             if (expectedX < 0 or expectedX >= layerSpatialSize):
@@ -2386,23 +4029,32 @@ class memoryManager:
 
             topLeftX = possibleTopLeftCoordinates[0][0]
             topLeftY = possibleTopLeftCoordinates[0][1]
+            kernelParts = tuple(
+                kernelY * DEPTHWISE_KERNEL_SIZE + kernelX
+                for kernelY in range(DEPTHWISE_KERNEL_SIZE)
+                for kernelX in range(DEPTHWISE_KERNEL_SIZE)
+                if (
+                    0 <= topLeftX + kernelX < layerSpatialSize
+                    and 0 <= topLeftY + kernelY < layerSpatialSize)
+            )
 
             return ActivationChunk(
                 type=firstActivation.type,
                 layer=firstActivation.layer,
                 x=topLeftX + kernelRadius,
                 y=topLeftY + kernelRadius,
-                channel=firstActivation.channel)
+                channel=firstActivation.channel,
+                kernelParts=kernelParts,
+                valuesStored=len(kernelParts))
 
         if (firstActivation.type == "pointwise"):
-            if (len(activationList) != POINTWISE_KERNEL_PARTS):
+            if (not 0 < len(activationList) <= DSP_CHUNK_SIZE):
                 raise Exception("ERROR! Pointwise activation chunk has incorrect number of activations")
 
-            lowestChannel = min(activation.channel for activation in activationList)
-            expectedChannels = set(range(lowestChannel, lowestChannel + len(activationList)))
-            actualChannels = {activation.channel for activation in activationList}
-            if (actualChannels != expectedChannels):
-                raise Exception("ERROR! Pointwise activations are not sequential")
+            inputChannels = tuple(activation.channel for activation in activationList)
+            lowestChannel = inputChannels[0]
+            if (inputChannels != tuple(sorted(set(inputChannels)))):
+                raise Exception("ERROR! Pointwise activation channels must be distinct and increasing")
 
             for activation in activationList:
                 if (activation.layer != firstActivation.layer):
@@ -2416,14 +4068,166 @@ class memoryManager:
                 x=firstActivation.x,
                 y=firstActivation.y,
                 channel=lowestChannel,
-                channelChunk=lowestChannel)
+                valuesStored=len(inputChannels),
+                inputChannels=inputChannels)
 
         raise Exception("ERROR! Unsupported activation type for activation chunk conversion")
 
+    def askForDepthwiseActivationChunk(
+            self,
+            layer,
+            outputX,
+            outputY,
+            channel,
+            kernelParts,
+            id):
+        if (layer <= 0 or layer >= layers or layerList[layer] != "depthwise"):
+            raise Exception("ERROR! Invalid depthwise activation chunk layer")
+        if (channel < 0 or channel >= channelsIn[layer]):
+            raise Exception("ERROR! Invalid depthwise activation channel")
+        if (len(kernelParts) == 0 or len(kernelParts) > 3):
+            raise Exception("ERROR! Depthwise DSP chunk must contain between one and three values")
+
+        sourceLayer = layer - 1
+        inputCenterX = outputX * stride[layer]
+        inputCenterY = outputY * stride[layer]
+        kernelRadius = DEPTHWISE_KERNEL_SIZE // 2
+        requestedActivations = []
+        for kernelPart in kernelParts:
+            kernelX = kernelPart % DEPTHWISE_KERNEL_SIZE
+            kernelY = kernelPart // DEPTHWISE_KERNEL_SIZE
+            inputX = inputCenterX + kernelX - kernelRadius
+            inputY = inputCenterY + kernelY - kernelRadius
+            if (
+                    inputX < 0 or inputX >= spatialOutput[sourceLayer]
+                    or inputY < 0 or inputY >= spatialOutput[sourceLayer]):
+                raise Exception("ERROR! Depthwise chunk requested a padded activation")
+            requestedActivations.append(Activation(
+                type=layerList[sourceLayer],
+                layer=sourceLayer,
+                x=inputX,
+                y=inputY,
+                channel=channel))
+
+        activationLocations = [
+            self.getActivationSRAMLocation(activation)
+            for activation in requestedActivations
+        ]
+        SRAMWords = []
+        for SRAMNum, SRAMAddr, _ in activationLocations:
+            SRAMWord = (SRAMNum, SRAMAddr)
+            if (SRAMWord not in SRAMWords):
+                SRAMWords.append(SRAMWord)
+
+        SRAMNumbers = [SRAMNum for SRAMNum, _ in SRAMWords]
+        if (len(SRAMNumbers) != len(set(SRAMNumbers))):
+            raise Exception("ERROR! Depthwise activation chunk requires multiple reads from one SRAM")
+        for SRAMNum, _ in SRAMWords:
+            SRAMobj = self.allSRAM[SRAMNum]
+            if (SRAMobj.isActiveRead() or SRAMobj.isActiveWrite()):
+                return False
+
+        packedWords = {
+            (SRAMNum, SRAMAddr): self.allSRAM[SRAMNum].readSRAM(SRAMAddr)
+            for SRAMNum, SRAMAddr in SRAMWords
+        }
+        for requestedActivation, (SRAMNum, SRAMAddr, packedIndex) in zip(
+                requestedActivations,
+                activationLocations):
+            storedActivation = packedWords[(SRAMNum, SRAMAddr)][packedIndex]
+            if (not isinstance(storedActivation, Activation)):
+                raise Exception("ERROR! Depthwise activation was not present in SRAM")
+            if (
+                    storedActivation.type != requestedActivation.type
+                    or storedActivation.layer != requestedActivation.layer
+                    or storedActivation.x != requestedActivation.x
+                    or storedActivation.y != requestedActivation.y
+                    or storedActivation.channel != requestedActivation.channel):
+                raise Exception("ERROR! SRAM returned the wrong depthwise activation")
+
+        DSPunit = DSPMngr.getDSPByID(id)
+        DSPunit.preloadActivation(ActivationChunk(
+            type="depthwise",
+            layer=layer,
+            x=inputCenterX,
+            y=inputCenterY,
+            channel=channel,
+            kernelParts=tuple(kernelParts),
+            valuesStored=len(kernelParts)))
+        return True
+
+    def askForPointwiseActivationChunk(self, layer, x, y, inputChannels, id):
+        if (layer <= 0 or layer >= layers):
+            raise Exception("ERROR! Pointwise activation layer is outside the readable layer range")
+        if (layerList[layer] != "pointwise"):
+            raise Exception("ERROR! Pointwise activation chunk requested for a non-pointwise layer")
+        if (channelsOut[layer - 1] != channelsIn[layer]):
+            raise Exception("ERROR! Pointwise input channel count does not match the preceding layer")
+        if (not 0 < len(inputChannels) <= DSP_CHUNK_SIZE
+                or inputChannels != tuple(sorted(set(inputChannels)))
+                or inputChannels[0] < 0
+                or inputChannels[-1] >= channelsIn[layer]):
+            raise Exception("ERROR! Pointwise activation chunk has invalid input channels")
+
+        sourceLayer = layer - 1
+        requestedActivations = [
+            Activation(
+                type=layerList[sourceLayer],
+                layer=sourceLayer,
+                x=x,
+                y=y,
+                channel=channel)
+            for channel in inputChannels
+        ]
+        activationLocations = [
+            self.getActivationSRAMLocation(activation)
+            for activation in requestedActivations
+        ]
+        SRAMWords = []
+        for SRAMNum, SRAMAddr, _ in activationLocations:
+            SRAMWord = (SRAMNum, SRAMAddr)
+            if (SRAMWord not in SRAMWords):
+                SRAMWords.append(SRAMWord)
+
+        SRAMNumbers = [SRAMNum for SRAMNum, _ in SRAMWords]
+        if (len(SRAMNumbers) != len(set(SRAMNumbers))):
+            raise Exception("ERROR! Pointwise activation chunk requires multiple reads from one SRAM")
+        for SRAMNum, _ in SRAMWords:
+            SRAMobj = self.allSRAM[SRAMNum]
+            if (SRAMobj.isActiveRead() or SRAMobj.isActiveWrite()):
+                return False
+
+        packedWords = {}
+        for SRAMNum, SRAMAddr in SRAMWords:
+            packedWords[(SRAMNum, SRAMAddr)] = self.allSRAM[SRAMNum].readSRAM(SRAMAddr)
+
+        for requestedActivation, (SRAMNum, SRAMAddr, packedIndex) in zip(
+                requestedActivations,
+                activationLocations):
+            storedActivation = packedWords[(SRAMNum, SRAMAddr)][packedIndex]
+            if (not isinstance(storedActivation, Activation)):
+                raise Exception("ERROR! Pointwise activation was not present in SRAM")
+            if (
+                    storedActivation.layer != requestedActivation.layer
+                    or storedActivation.x != requestedActivation.x
+                    or storedActivation.y != requestedActivation.y
+                    or storedActivation.channel != requestedActivation.channel):
+                raise Exception("ERROR! SRAM returned the wrong pointwise activation")
+
+        DSPunit = DSPMngr.getDSPByID(id)
+        DSPunit.preloadActivation(ActivationChunk(
+            type="pointwise",
+            layer=layer,
+            x=x,
+            y=y,
+            channel=inputChannels[0],
+            valuesStored=len(inputChannels),
+            inputChannels=inputChannels))
+        return True
+
     def askForKernel(self, kernel: Kernel, id):
-        # We basically need to bridge the gap between the start of the layer and the
-        # position of the kernel just by knowing the
-        # layer and the channel (and channel group for pointwise)
+        # Locate spatial depthwise weights or the explicitly selected pointwise
+        # input channels within the layer's stored weights.
         
         if isinstance(kernel, DepthwiseKernel):
             totalSteps = kernel.channel * DEPTHWISE_KERNEL_PARTS     # Total number of weights forward we need to go
@@ -2452,7 +4256,8 @@ class memoryManager:
             
             # So, now we know that the kernel starts at:
             # (LRAMKernelStart, AddrKernelStart, packedKernelStart)
-            # We just need to read the following 9 weights from memory, and feed it to a DSP unit
+            # Fetch the full spatial kernel; the depthwise scheduler splits it
+            # into the smaller operands assigned to individual DSPs.
             
             # This shouldn't error out when you are too greedy with your reads, but it does. The readSequentially
             # function should take in a list as an object or return a tuple with a list, and also return true/false
@@ -2473,9 +4278,46 @@ class memoryManager:
             
             dsp.preloadKernel(returnedKernel)
         elif (isinstance(kernel, PointwiseKernel)):
-            # I will implement this later, should be similar to code above, just need to add a check
-            # for if it is at the part of the code where we store one half of a chunk near another
-            return False
+            # Pointwise weights are stored output-channel major. Each output
+            # channel contains sequential input-channel weights. Gather only
+            # this DSP's channels, retaining progress when an LRAM is busy.
+            if (not 0 < len(kernel.inputChannels) <= DSP_CHUNK_SIZE
+                    or kernel.inputChannels != tuple(sorted(set(kernel.inputChannels)))
+                    or kernel.inputChannels[0] < 0
+                    or kernel.inputChannels[-1] >= channelsIn[kernel.layer]
+                    or kernel.channel < 0 or kernel.channel >= channelsOut[kernel.layer]):
+                raise Exception("ERROR! Pointwise kernel has invalid input or output channels")
+
+            pendingRead = self.pendingPointwiseKernelReads.get(id)
+            if (pendingRead is None or pendingRead[0] != kernel):
+                pendingRead = (replace(kernel), [])
+                self.pendingPointwiseKernelReads[id] = pendingRead
+            weights = pendingRead[1]
+            layerLRAMStart, layerAddrStart, layerPackedStart = self.startOfLayer[kernel.layer]
+
+            for inputChannel in kernel.inputChannels[len(weights):]:
+                packedOffset = (
+                    int(layerPackedStart)
+                    + kernel.channel * int(channelsIn[kernel.layer])
+                    + inputChannel)
+                wordOffset, packedIndex = divmod(packedOffset, WEIGHTS_PER_LRAM_ADDRESS)
+                logicalLRAM = int(layerLRAMStart) + wordOffset
+                LRAMNum = logicalLRAM % NUM_LRAMS
+                LRAMAddr = int(layerAddrStart) + logicalLRAM // NUM_LRAMS
+                weightRead = []
+                if (not self.readSequentially(LRAMNum, LRAMAddr, packedIndex, 1, weightRead)):
+                    return False
+                weights.extend(weightRead)
+
+            returnedKernel = self.weightsToKernel(weights)
+            if (returnedKernel != kernel):
+                raise Exception(
+                    f"ERROR! Memory returned the wrong kernel. Desired kernel: {kernel}, "
+                    f"returned kernel: {returnedKernel}")
+
+            dsp = DSPMngr.getDSPByID(id)
+            dsp.preloadKernel(returnedKernel)
+            del self.pendingPointwiseKernelReads[id]
         else:
             raise Exception("Unrecognized Kernel type")
         
@@ -2711,166 +4553,35 @@ layer = 0
 indexPointer = 0
 memory = memoryManager()
 
-# NEW FORMAT?
-# Memory format:
-# IF POINTWISE:
-# If the number of channels and the spatial size permits us to calculate 1/4th of the kernel independently,
-# then the format is:
-# Weight 0 - Channel 0, Weight 1 - Channel 0, Weight 2 - Channel 0, Weight 3 - Channel 0, Weight 4 - Channel 0
-# Weight 5 - Channel 0, Weight 6 - Channel 0, Weight 7 - Channel 0, Weight 8 - Channel 0, 
-# Weight 0 - Channel 1, Weight 1 - Channel 1, Weight 2 - Channel 1, ...
-# Otherwise, store the weights like this:
-# Weight 0 - Channel 0, Weight 1 - Channel 0, Weight 2 - Channel 0, Weight 3 - Channel 0, Weight 4 - Channel 0,
-# Weight 5 - Channel 0, Weight 6 - Channel 0, Weight 7 - Channel 0, Weight 8 - Channel 0
-# Weight (channelsIn[layer] // 2) - Channel 0, Weight (channelsIn[layer] // 2) + 1 - Channel 0,
-# Weight (channelsIn[layer] // 2) + 2 - Channel 0, Weight (channelsIn[layer] // 2) + 3 - Channel 0,
-# IF DEPTHWISE:
-# Store the weights in blocks of 9, with increasing channels:
-# Weight 0 - Channel 0, Weight 1 - Channel 0, Weight 2 - Channel 0, Weight 3 - Channel 0,
-# Weight 4 - Channel 0, Weight 5 - Channel 0, Weight 6 - Channel 0, Weight 7 - Channel 0,
-# Weight 8 - Channel 0
-# I will probably do it this way, but I will only bother trying once I need to
-
-# Memory format:
-# IF POINTWISE:
-# If the number of channels and the spatial size permits us to calculate 1/4th of the kernel independently,
-# then the format is:
-# Weight 0 - Channel 0, Weight 0 - Channel 1, Weight 0 - Channel 2, Weight 0 - Channel 3, etc
-# Weight 1 - Channel 0, Weight 1 - Channel 1, Weight 1 - Channel 2, Weight 1 - Channel 3, etc
-# Otherwise, store the weights like this:
-# Weight 0 - Channel 0, Weight (channelsIn[layer] // 2) - Channel 0
-# Weight 0 - Channel 1, Weight (channelsIn[layer] // 2) - Channel 1
-# etc
-# then...
-# Weight 1 - Channel 0, Weight (channelsIn[layer] // 2) + 1 - Channel 0
-# Weight 1 - Channel 1, Weight (channelsIn[layer] // 2) + 1 - Channel 1
-# IF DEPTHWISE:
-# Store the weights in blocks of 9, with increasing channels:
-# Weight 0 - Channel 0, Weight 1 - Channel 0, Weight 2 - Channel 0, Weight 3 - Channel 0,
-# Weight 4 - Channel 0, Weight 5 - Channel 0, Weight 6 - Channel 0, Weight 7 - Channel 0,
-# Weight 8 - Channel 0
-#
-# Also, we should store where the start of every layer is
-startOfLayers = []
-
+# Store each pointwise matrix in output-channel-major order. Chunk boundaries
+# belong to the DSP scheduler; they do not change the weight layout in memory.
+# Depthwise kernels contain all spatial weights for each channel in turn.
 for layer in range(layers - NUM_MISC_LAYERS):
-    memory.markLayerStart(layer) 
-    channel = 0
-    channelsCompleted = 0
-    part = 0
-    
+    memory.markLayerStart(layer)
     if (layerList[layer] == "depthwise"):
-        layerKernelParts = DEPTHWISE_KERNEL_PARTS
-        chunkSize = DEPTHWISE_KERNEL_PARTS
+        layerWeights = (
+            DepthwiseWeight(layer=layer, channel=channel, part=part)
+            for channel in range(channelsOut[layer])
+            for part in range(DEPTHWISE_KERNEL_PARTS)
+        )
     elif (layerList[layer] == "pointwise"):
-        layerKernelParts = channelsIn[layer]
-        chunkSize = POINTWISE_KERNEL_PARTS
+        layerWeights = (
+            PointwiseWeight(layer=layer, y=outputChannel, channel=inputChannel)
+            for outputChannel in range(channelsOut[layer])
+            for inputChannel in range(channelsIn[layer])
+        )
     else:
         raise Exception("ERROR! Unsupported convolution weight type")
-    
-    segment_pixels = spatialOutput[layer] ** 2 // 4
-    input_chunks = channelsIn[layer] // POINTWISE_KERNEL_PARTS
-    
-    if (input_chunks % 4 != 0):
-        adj_input_chunks = input_chunks + (4 - input_chunks % 4)
-    else:
-        adj_input_chunks = input_chunks
-    
-    one_shots_spatial_segment = (
-        segment_pixels * adj_input_chunks < NUM_DSPS
-    )
 
-    if (one_shots_spatial_segment and layerList[layer] == "pointwise"):
-        print(f"segment_pixels is {segment_pixels}")
-        print(f"input_chunks is {input_chunks}")
-        print(f"adj_input_chunks is {adj_input_chunks}")
-        raise Exception(f"Layer is {layer}")
-        outputOffset = 0
-        inputOffset = 0
-        part = 0
-        storeSecondHalf = False
-        while outputOffset < (channelsOut[layer]//2):
-            for cycle in range(MAX_SIMULTANEOUS_LRAM_WRITES * WEIGHTS_PER_LRAM_ADDRESS):
-                if (not storeSecondHalf):
-                    outputChannel = outputOffset
-                else:
-                    outputChannel = outputOffset + (channelsOut[layer]//2)
-
-                inputChannel = part + inputOffset*chunkSize
-                weight = PointwiseWeight(layer=layer, channel=inputChannel, y=outputChannel)
-                memory.loadWeightsInStart(weight)
-
-                part += 1
-                if (part >= chunkSize):
-                    inputOffset += 1
-                    part = 0
-
-                if (inputOffset*chunkSize >= layerKernelParts):
-                    inputOffset = 0
-                    part = 0
-                    if (storeSecondHalf):
-                        outputOffset += 1
-                    storeSecondHalf = not storeSecondHalf
-
-                if (outputOffset >= (channelsOut[layer]//2)):
-                    break
-
+    weightsLoadedThisCycle = 0
+    for weight in layerWeights:
+        memory.loadWeightsInStart(weight)
+        weightsLoadedThisCycle += 1
+        if (weightsLoadedThisCycle == MAX_SIMULTANEOUS_LRAM_WRITES * WEIGHTS_PER_LRAM_ADDRESS):
             clkCycles += 1
-    elif (layerList[layer] == "pointwise"):
-        outputChannel = 0
-        offset = 0
-        totalParts = 0
-        while outputChannel < channelsOut[layer]:
-            for cycle in range(MAX_SIMULTANEOUS_LRAM_WRITES * WEIGHTS_PER_LRAM_ADDRESS):
-                totalParts = part + offset*chunkSize
-                weight = PointwiseWeight(layer=layer, channel=totalParts, y=outputChannel)
-                memory.loadWeightsInStart(weight)
-
-                part += 1
-                if (part >= chunkSize):
-                    offset += 1
-                    part = 0
-
-                if (offset*chunkSize >= layerKernelParts):
-                    outputChannel += 1
-                    offset = 0
-                    part = 0
-
-                if (outputChannel >= channelsOut[layer]):
-                    break
-
-            clkCycles += 1
-    else:
-        offset = 0
-        totalParts = 0
-        while offset*chunkSize < layerKernelParts:
-            for cycle in range(MAX_SIMULTANEOUS_LRAM_WRITES * WEIGHTS_PER_LRAM_ADDRESS):
-                if (layerList[layer] == "depthwise"):
-                    weight = DepthwiseWeight(layer, channel, part)
-                elif (layerList[layer] == "pointwise"):
-                    weight = PointwiseWeight(layer=layer, channel=channel,
-                        y=totalParts)
-                else:
-                    raise Exception("ERROR! Unsupported convolution weight type")
-                memory.loadWeightsInStart(weight)
-                
-                part += 1
-                if (part >= chunkSize):
-                    channel += 1
-                    part = 0
-                
-                if (channel >= channelsOut[layer]):
-                    offset += 1
-                    channel = 0
-                    if (layerList[layer] == "depthwise"):
-                        break
-                
-                totalParts = part+offset*chunkSize
-                
-                if (offset*chunkSize >= layerKernelParts):
-                    break
-                
-            clkCycles += 1
+            weightsLoadedThisCycle = 0
+    if (weightsLoadedThisCycle > 0):
+        clkCycles += 1
 
 # For this next part, we are just going to store every row of the matrix sequentially
 # So it looks like:
@@ -2955,7 +4666,7 @@ inferenceCompleted = False
 
 imageJustIn = True
 
-SIM_LIMIT = 1000000
+SIM_LIMIT = 2000000
 
 while (inferenceCompleted == False and not clkCycles > SIM_LIMIT):
     
@@ -2974,7 +4685,7 @@ while (inferenceCompleted == False and not clkCycles > SIM_LIMIT):
             targetX = targetOutputX * stride[0]
             targetY = targetOutputY * stride[0]
 
-            kernelRadius = kernelSize[0] // 2
+            kernelRadius = DEPTHWISE_KERNEL_SIZE // 2
             lastNeededX = min(targetX + kernelRadius, imxCamera.width - 1)
             lastNeededY = min(targetY + kernelRadius, imxCamera.height - 1)
             lastNeededPixel = imxCamera.xyToPixelCounter(lastNeededX, lastNeededY)
@@ -2987,7 +4698,6 @@ while (inferenceCompleted == False and not clkCycles > SIM_LIMIT):
                 if (DSPMngr.startDepthwiseConvFromCamera(targetX, targetY, imxCamera)):
                     pixelsComputed += 1
     else:
-        break
         if (imageJustIn):
             exportToJSON(memory, "image just recieved")
             imageJustIn = False
@@ -3007,30 +4717,37 @@ while (inferenceCompleted == False and not clkCycles > SIM_LIMIT):
     nextLayer = lastCompletedLayer + 1
     
     if (squeezeExcite[lastCompletedLayer] and not pixelMap.isSEVectorCalculated(lastCompletedLayer)):
+        print(f"cycles: {clkCycles}, performing SE, lastCompletedLayer: {lastCompletedLayer}\n")
         if (not DSPMngr.isSEVectorCalculating()):
             DSPMngr.startSEVectorCalc(lastCompletedLayer)
         elif (pixelMap.isSEVectorCalculated(lastCompletedLayer)):
             pass
             # I think the only way to really implement attention efficiently is with bit-shifts
             # There is no activation after attention is applied
-    else:
-        if (layerType[nextLayer] == "pointwise"):
-            if (not pixelMap.isQuarterFinished(nextLayer, 1)):
-                pass
-            elif (not pixelMap.isQuarterFinished(nextLayer, 2)):
-                pass
-            elif (not pixelMap.isQuarterFinished(nextLayer, 3)):
-                pass
-            elif (not pixelMap.isQuarterFinished(nextLayer, 4)):
-                pass
-            # If segment 1 is not completed, do segment 1
-            # If segment 2 is not completed, do segment 2
-            # If segment 3 is not completed, do segment 3
-            # If segment 4 is not completed, do segment 4
-    
+    elif (not squeezeExcite[lastCompletedLayer] or (squeezeExcite[lastCompletedLayer] and pixelMap.isSEVectorCalculated(lastCompletedLayer))):
+        print(f"cycles: {clkCycles}, performing conv, lastCompletedLayer: {lastCompletedLayer}\n")
+        for layer in range(lastCompletedLayer + 1, lastCompletedLayer + 3):
+            for quarter in range(1, SEGMENTS_PER_LAYER + 1):
+                if (layerList[layer] == "pointwise"):
+                    if (pixelMap.isQuarterFinished(layer - 1, quarter)
+                        and not pixelMap.isQuarterFinished(layer, quarter)
+                        and not DSPMngr.pwConvEnq(layer, quarter)):
+                            DSPMngr.startPointwiseConv(
+                                layer,
+                                quarter,
+                                completedQuarters=pixelMap.getCompletedQuarters(layer))
+                if (layer > 0 and layerList[layer] == "depthwise"):
+                    if (pixelMap.isQuarterFinished(layer - 1, quarter)
+                        and not pixelMap.isQuarterFinished(layer, quarter)
+                        and not DSPMngr.dwConvEnq(layer, quarter)):
+                            DSPMngr.startDepthwiseConv(layer, quarter)
+                if (lastCompletedLayer == 34):
+                    DSPMngr.startFullyConnected()
     # Fully Connected Neural Net Logic
     
     DSPMngr.update()
+    if (DSPMngr.fullyConnectedComplete):
+        inferenceCompleted = True
     clkCycles += 1
 
 exportToJSON(memory, "done with inference")

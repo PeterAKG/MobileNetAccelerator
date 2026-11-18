@@ -266,6 +266,17 @@ HTML = r"""<!doctype html>
       background: #fff;
     }
 
+    .waterfallViewport {
+      max-height: min(65vh, 620px);
+      overflow-y: auto;
+      border: 1px solid var(--line);
+      background: #fff;
+    }
+
+    .waterfallViewport canvas {
+      border: 0;
+    }
+
     .tableWrap {
       max-height: calc(100vh - 134px);
       overflow: auto;
@@ -397,7 +408,9 @@ HTML = r"""<!doctype html>
         </div>
         <div class="chartBlock">
           <div class="chartTitle">DSP Waterfall</div>
-          <canvas id="dspWaterfallCanvas" height="340"></canvas>
+          <div class="waterfallViewport">
+            <canvas id="dspWaterfallCanvas" height="340"></canvas>
+          </div>
         </div>
       </section>
       <div class="tableWrap">
@@ -618,9 +631,11 @@ HTML = r"""<!doctype html>
       startOfLayerEl.innerHTML = header + rows;
     }
 
-    function resizeCanvas(canvas) {
+    function resizeCanvas(canvas, requestedHeight = null) {
       const width = Math.max(320, Math.floor(canvas.clientWidth));
-      const height = Number(canvas.getAttribute("height"));
+      const height = requestedHeight === null
+        ? Number(canvas.getAttribute("height"))
+        : Math.max(1, Math.floor(requestedHeight));
       if (canvas.width !== width || canvas.height !== height) {
         canvas.width = width;
         canvas.height = height;
@@ -772,16 +787,18 @@ HTML = r"""<!doctype html>
         return;
       }
 
-      resizeCanvas(dspWaterfallCanvas);
-      const ctx = dspWaterfallCanvas.getContext("2d");
-      const width = dspWaterfallCanvas.width;
-      const height = dspWaterfallCanvas.height;
-      const padLeft = 48;
+      const padLeft = 58;
       const padRight = 10;
       const padTop = 12;
       const padBottom = 26;
+      const dspRowHeight = 14;
+      const visibleDSPs = Math.max(1, dsp.numDSPsShown);
+      const plotHeight = visibleDSPs * dspRowHeight;
+      resizeCanvas(dspWaterfallCanvas, padTop + plotHeight + padBottom);
+      const ctx = dspWaterfallCanvas.getContext("2d");
+      const width = dspWaterfallCanvas.width;
+      const height = dspWaterfallCanvas.height;
       const plotWidth = width - padLeft - padRight;
-      const plotHeight = height - padTop - padBottom;
       const visibleCount = Math.max(1, range.endIndex - range.startIndex);
 
       ctx.clearRect(0, 0, width, height);
@@ -791,20 +808,25 @@ HTML = r"""<!doctype html>
       ctx.strokeRect(padLeft, padTop, plotWidth, plotHeight);
 
       ctx.fillStyle = "#5f6b7a";
+      ctx.font = "10px Segoe UI, system-ui, sans-serif";
+      ctx.textAlign = "right";
+      ctx.textBaseline = "middle";
+      for (let dspIndex = 0; dspIndex < visibleDSPs; dspIndex += 1) {
+        const y = padTop + (dspIndex + 0.5) * dspRowHeight;
+        ctx.fillText(`DSP${dsp.dspStart + dspIndex}`, padLeft - 6, y);
+      }
+
       ctx.font = "12px Segoe UI, system-ui, sans-serif";
-      ctx.fillText(`DSP${dsp.dspStart}`, 8, padTop + 10);
-      ctx.fillText(`DSP${dsp.dspEnd - 1}`, 8, padTop + plotHeight);
+      ctx.textBaseline = "alphabetic";
+      ctx.textAlign = "left";
       ctx.fillText(String(dspClockAtIndex(range.startIndex)), padLeft, height - 7);
       ctx.textAlign = "right";
       ctx.fillText(String(dspClockAtIndex(range.endIndex - 1)), width - padRight, height - 7);
       ctx.textAlign = "left";
 
       ctx.fillStyle = "#d7352a";
-      const visibleDSPs = Math.max(1, dsp.numDSPsShown);
-      const rowHeight = plotHeight / visibleDSPs;
       for (let dspIndex = 0; dspIndex < dsp.activeRuns.length; dspIndex += 1) {
-        const y = padTop + dspIndex * rowHeight;
-        const h = Math.max(1, Math.ceil(rowHeight));
+        const y = padTop + dspIndex * dspRowHeight;
         for (const run of dsp.activeRuns[dspIndex]) {
           const runStart = Math.max(run[0], range.startIndex);
           const runEnd = Math.min(run[1], range.endIndex);
@@ -813,9 +835,19 @@ HTML = r"""<!doctype html>
           }
           const x = padLeft + ((runStart - range.startIndex) / visibleCount) * plotWidth;
           const w = Math.max(1, ((runEnd - runStart) / visibleCount) * plotWidth);
-          ctx.fillRect(x, y, w, h);
+          ctx.fillRect(x, y, w, dspRowHeight);
         }
       }
+
+      ctx.beginPath();
+      for (let dspBoundary = 0; dspBoundary <= visibleDSPs; dspBoundary += 1) {
+        const y = Math.round(padTop + dspBoundary * dspRowHeight) + 0.5;
+        ctx.moveTo(padLeft, y);
+        ctx.lineTo(padLeft + plotWidth, y);
+      }
+      ctx.strokeStyle = "rgba(95, 107, 122, 0.45)";
+      ctx.lineWidth = 1;
+      ctx.stroke();
     }
 
     function escapeHTML(value) {
